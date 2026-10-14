@@ -30,7 +30,7 @@ def main():
     # Disable the live daily-close watcher for isolated fixed-time fixtures.
     results = {symbol: replace(analyze(symbol, client, now=now), market_versions=None)
                for symbol in symbols}
-    app = AppTest.from_file(str(PROJECT / "app.py"))
+    app = AppTest.from_file(str(PROJECT / "views" / "detail.py"))
     rows = []
     try:
         for index, symbol in enumerate(symbols * 6):

@@ -26,11 +26,22 @@ Then start the dashboard:
 .\.venv\Scripts\python -m streamlit run app.py
 ```
 
-Open the local address printed by Streamlit, enter a ticker such as `NVDA`, and click **分析**. Python 3.11 or newer is recommended. Activation of the virtual environment is optional because the commands use its Python executable directly.
+Open the local address printed by Streamlit. The app opens on the **自选股总览** (watchlist) page; the **个股分析** page in the top navigation is the single-ticker dashboard, where you enter a ticker such as `NVDA` and click **分析**. If you upgraded from an earlier version, rerun the `pip install -r requirements-dev.txt` command: the page navigation needs Streamlit 1.46 or newer. Python 3.11 or newer is recommended. Activation of the virtual environment is optional because the commands use its Python executable directly.
 
 `FMP_API_KEY` in the process environment takes precedence over `.env`. Configuration loads only the `.env` next to `config.py`; it does not search sibling projects. The real `.env`, virtual environment, local artifacts, and Streamlit secrets are ignored by Git. Do not paste keys into source files, screenshots, logs, or issues. The adapter exposes fixed error messages instead of provider response bodies or credential-bearing request URLs.
 
 The default host is the official FMP API and uses its query-parameter authentication. If your existing FMP access uses a gateway, configure the matching `FMP_BASE_URL` and `FMP_AUTH_MODE=proxy`; proxy mode sends the credential in `X-Proxy-Key`. Keep a gateway credential paired with its intended host. `FMP_CA_BUNDLE` can specify a trusted CA bundle for that gateway. HTTPS certificate verification stays enabled; the app does not disable verification to make a request succeed.
+
+## Watchlist home page
+
+The home page lists every saved ticker with its action (Buy/Wait, or Hold/Reduce/Sell for tickers marked as held), weighted score, daily bias, latest price and change, the main reason behind the action, distance to the chandelier stop, 3-month strength against SPY, and the next earnings date. It is sorted by score; clicking a row opens that ticker on the 个股分析 page with its held state.
+
+- **＋ 添加股票** adds a ticker (validated, no duplicates, up to 50) and analyzes just that ticker.
+- **↻ 刷新全部** re-fetches every ticker, bypassing caches.
+- **自动刷新** (default every 15 minutes, or 5/30/60 minutes, or off) refreshes the whole list during NYSE regular hours, and fetches the new completed close once after each close.
+- **编辑自选股** marks tickers as held or removes them. The 个股分析 page has **☆ 加入自选股**, and its "currently held" toggle updates the watchlist too.
+
+The list is saved in `watchlist.json` next to `.env` (set `WATCHLIST_FILE` to move it). It holds only symbols and held flags; add it to `.gitignore` if you keep this project in Git. An unreadable file is reported and never overwritten. The watchlist analyzes daily bars only, since every action rule uses completed daily bars; each ticker costs one daily request plus the cached SPY, sector-ETF, profile and earnings requests, and up to three tickers load at a time.
 
 ## What version 1 implements
 
@@ -106,7 +117,7 @@ The endpoints `/stable/historical-price-eod/full` and `/stable/historical-chart/
 
 ## Verification
 
-The rules, score, market-context and backtest update passed **251 offline checks** (`pytest -q`), including no-look-ahead and offline backtest-command checks. It has not yet been run against live FMP data; `scripts/check_live.py` and `scripts/backtest.py` need your local key.
+The watchlist home page update passed **268 offline checks**, including add/refresh/auto-refresh, unreadable-file protection, daily-only batch requests and opening a row on the detail page. The rules, score, market-context and backtest update before it passed **251 offline checks** (`pytest -q`), including no-look-ahead and offline backtest-command checks. It has not yet been run against live FMP data; `scripts/check_live.py` and `scripts/backtest.py` need your local key.
 
 Earlier record:
 
@@ -132,7 +143,11 @@ The real-ticker check on **2026-10-12** succeeded through the locally configured
 
 | Module | Responsibility |
 | --- | --- |
-| `app.py` | Streamlit presentation and Plotly charts consuming structured results |
+| `app.py` | Streamlit entry point and page navigation |
+| `views/home.py` | Watchlist home page: add, refresh, auto-refresh, summary table |
+| `views/detail.py` | Single-ticker page: charts, assessment, support/resistance |
+| `data/watchlist.py` | Local watchlist file: load, atomic save, add/remove, held flags |
+| `services/watchlist_service.py` | Concurrent daily-only analysis of every watchlist ticker, condensed into table rows |
 | `config.py` | Project-local settings and credentials |
 | `data/fmp_client.py` | FMP requests, caching, and sanitized failures |
 | `data/market_store.py` | Bounded validated OHLCV snapshots, content versions and exchange-calendar freshness |

@@ -21,14 +21,15 @@ from models import DataError
 from services import analysis_service
 from services.analysis_service import AnalysisResult, Snapshot
 
-APP = Path(__file__).resolve().parents[1] / "app.py"
+APP = Path(__file__).resolve().parents[1] / "views" / "detail.py"
 NEW_YORK = ZoneInfo("America/New_York")
 _APP_TESTS = []
 
 
 @pytest.fixture(autouse=True)
-def isolated_app_configuration(monkeypatch):
-    """Never consume a real local credential or a custom gateway in tests."""
+def isolated_app_configuration(monkeypatch, tmp_path):
+    """Never consume a real local credential, gateway or watchlist in tests."""
+    monkeypatch.setenv("WATCHLIST_FILE", str(tmp_path / "watchlist.json"))
     monkeypatch.setenv("FMP_API_KEY", "offline-test-key")
     monkeypatch.setenv("FMP_BASE_URL", "https://financialmodelingprep.com")
     monkeypatch.setenv("FMP_AUTH_MODE", "query")

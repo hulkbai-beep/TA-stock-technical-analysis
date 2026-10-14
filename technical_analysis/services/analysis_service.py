@@ -235,8 +235,12 @@ def analyze(
     client: MarketDataClient,
     now: datetime | None = None,
     refresh: bool = False,
+    include_intraday: bool = True,
 ) -> AnalysisResult:
     """Daily failures stop analysis; unavailable intraday remains partial success.
+
+    `include_intraday=False` skips the 5-minute request entirely (the
+    watchlist uses this); decisions come from completed daily bars either way.
 
     A cached response is normalized at min(request time, retrieval time).
     Consequently a cached unfinished candle cannot become a confirmed candle
@@ -246,7 +250,8 @@ def analyze(
     symbol = validate_symbol(symbol)
     local_now = _local_timestamp(now)
     daily_future = _DATA_WORKERS.submit(_load_market, client, symbol, "daily", now, refresh)
-    intraday_future = _DATA_WORKERS.submit(_load_market, client, symbol, "intraday", now, refresh)
+    intraday_future = (_DATA_WORKERS.submit(_load_market, client, symbol, "intraday", now, refresh)
+                       if include_intraday else None)
     context_future = _DATA_WORKERS.submit(_load_context, client, symbol, now)
     daily_data = daily_future.result()
     if daily_data.frame.empty:
@@ -257,7 +262,7 @@ def analyze(
     intraday_api_ms = 0.0
     intraday_cache_hit = False
     try:
-        intraday_data = intraday_future.result()
+        intraday_data = intraday_future.result() if intraday_future is not None else None
     except DataError as error:
         intraday_error, error_code = str(error), error.code
         intraday_api_ms = getattr(error, "api_seconds", 0.0) * 1000
@@ -281,7 +286,7 @@ def analyze(
            tuple(daily_data.issues), None if intraday_data is None else intraday_data.latest_session,
            None if intraday_data is None else intraday_data.version,
            () if intraday_data is None else tuple(intraday_data.issues), error_code, context_versions,
-           context.next_earnings, context.earnings_checked, context.notes)
+           context.next_earnings, context.earnings_checked, context.notes, include_intraday)
     cache = _derived_cache(client)
     compute_started = perf_counter()
     with _DERIVED_LOCK:
