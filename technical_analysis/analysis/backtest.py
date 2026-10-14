@@ -12,12 +12,11 @@ from dataclasses import dataclass, field
 from datetime import date
 from bisect import bisect_left
 import math
-from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-from analysis.strategy import StrategyConfig, evaluate_bar
+from analysis.strategy import SETUP_SHORT, StrategyConfig, evaluate_bar
 from data.normalize import session_schedule
 
 FORWARD_SESSIONS = 10
@@ -35,6 +34,7 @@ class Trade:
     sessions_held: int
     entry_score: float | None
     exit_reason: str
+    setup: str | None = None
 
 
 @dataclass
@@ -57,7 +57,6 @@ def _valid(row) -> bool:
 
 def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None = None, *,
                  earnings_dates: tuple[date, ...] | None = None, cost_bps: float = 5.0,
-                 support_resistance_for: Callable[[pd.DataFrame], object] | None = None,
                  start: date | None = None) -> BacktestResult:
     """Simulate the entry/exit rules over a featured daily frame.
 
@@ -75,7 +74,7 @@ def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None
     cost = cost_bps / 10_000
     earnings = sorted(earnings_dates) if earnings_dates is not None else None
     held_fraction = 0.0
-    entry_index = entry_price = entry_score = None
+    entry_index = entry_price = entry_score = entry_setup = None
     realized = 0.0
     pending: tuple[str, str] | None = None
     base = 1.0
@@ -96,7 +95,8 @@ def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None
             held_fraction -= sold
             if held_fraction <= 1e-9:
                 result.trades.append(Trade(symbol, frame.iloc[entry_index]["session"], entry_price, row["session"],
-                                           price_open, realized, index - entry_index, entry_score, pending[1]))
+                                           price_open, realized, index - entry_index, entry_score, pending[1],
+                                           entry_setup))
                 base *= 1 + realized
                 held_fraction, realized = 0.0, 0.0
         elif pending is not None and pending[0] == "buy" and held_fraction == 0:
@@ -114,8 +114,7 @@ def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None
         if earnings is not None:
             position = bisect_left(earnings, row["session"])
             next_earnings = earnings[position] if position < len(earnings) else None
-        sr = support_resistance_for(frame.iloc[:index + 1]) if support_resistance_for else None
-        decision = evaluate_bar(prior, row, config, support_resistance=sr, next_earnings=next_earnings,
+        decision = evaluate_bar(prior, row, config, next_earnings=next_earnings,
                                 earnings_checked=earnings is not None)
         forward = (closes[index + FORWARD_SESSIONS] / closes[index] - 1
                    if index + FORWARD_SESSIONS < len(frame) else np.nan)
@@ -125,11 +124,13 @@ def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None
         elif held_fraction == 0 and decision.buy and index + 1 < len(frame):
             pending = ("buy", "")
             entry_score = decision.score.score
+            entry_setup = decision.trigger
     if held_fraction > 0:
         last = frame.iloc[-1]
         result.trades.append(Trade(symbol, frame.iloc[entry_index]["session"], entry_price, None, float(last["close"]),
                                    realized + held_fraction * (float(last["close"]) / entry_price - 1),
-                                   len(frame) - 1 - entry_index, entry_score, "仍持有（按最后收盘估值）"))
+                                   len(frame) - 1 - entry_index, entry_score, "仍持有（按最后收盘估值）",
+                                   entry_setup))
     result.observations = pd.DataFrame(observations, columns=["session", "score", "buy", "forward_return"])
     result.equity = pd.Series([value for _, value in equity], index=[session for session, _ in equity], dtype=float)
     traded = frame.iloc[first:]
@@ -139,22 +140,28 @@ def run_backtest(symbol: str, daily: pd.DataFrame, config: StrategyConfig | None
     return result
 
 
+def _trade_stats(returns: np.ndarray) -> dict:
+    wins, losses = returns[returns > 0], returns[returns <= 0]
+    return {
+        "trades": len(returns),
+        "win_rate": float((returns > 0).mean()) if len(returns) else np.nan,
+        "avg_return": float(returns.mean()) if len(returns) else np.nan,
+        "median_return": float(np.median(returns)) if len(returns) else np.nan,
+        "avg_win": float(wins.mean()) if len(wins) else np.nan,
+        "avg_loss": float(losses.mean()) if len(losses) else np.nan,
+        "profit_factor": float(wins.sum() / -losses.sum()) if len(losses) and losses.sum() < 0 else np.nan,
+    }
+
+
 def summarize(results: list[BacktestResult]) -> dict[str, pd.DataFrame]:
-    """Per-symbol trade statistics and score-bucket forward returns."""
+    """Per-symbol and per-setup trade statistics, and score-bucket forward returns."""
     rows = []
     for item in results:
         returns = np.array([trade.weighted_return for trade in item.trades], dtype=float)
-        wins, losses = returns[returns > 0], returns[returns <= 0]
         curve = item.equity
         drawdown = float((curve / curve.cummax() - 1).min()) if len(curve) else np.nan
         rows.append({
-            "symbol": item.symbol, "trades": len(returns),
-            "win_rate": float((returns > 0).mean()) if len(returns) else np.nan,
-            "avg_return": float(returns.mean()) if len(returns) else np.nan,
-            "median_return": float(np.median(returns)) if len(returns) else np.nan,
-            "avg_win": float(wins.mean()) if len(wins) else np.nan,
-            "avg_loss": float(losses.mean()) if len(losses) else np.nan,
-            "profit_factor": float(wins.sum() / -losses.sum()) if len(losses) and losses.sum() < 0 else np.nan,
+            "symbol": item.symbol, **_trade_stats(returns),
             "avg_sessions": float(np.mean([trade.sessions_held for trade in item.trades])) if item.trades else np.nan,
             "strategy_return": float(curve.iloc[-1] - 1) if len(curve) else np.nan,
             "max_drawdown": drawdown, "exposure": item.exposure, "buy_and_hold": item.buy_and_hold,
@@ -171,8 +178,16 @@ def summarize(results: list[BacktestResult]) -> dict[str, pd.DataFrame]:
                         f"avg_{FORWARD_SESSIONS}d_return": float(chunk.mean()) if len(chunk) else np.nan,
                         "hit_rate": float((chunk > 0).mean()) if len(chunk) else np.nan,
                         "vs_all_bars": float(chunk.mean() - baseline) if len(chunk) else np.nan})
-    trades = pd.DataFrame([vars(trade) for item in results for trade in item.trades])
-    return {"symbols": pd.DataFrame(rows), "score_buckets": pd.DataFrame(buckets), "trades": trades}
+    all_trades = [trade for item in results for trade in item.trades]
+    setups = []
+    for code, label in SETUP_SHORT.items():
+        chosen = [trade for trade in all_trades if trade.setup == code]
+        returns = np.array([trade.weighted_return for trade in chosen], dtype=float)
+        setups.append({"setup": label, **_trade_stats(returns),
+                       "avg_sessions": float(np.mean([trade.sessions_held for trade in chosen])) if chosen else np.nan})
+    trades = pd.DataFrame([vars(trade) for trade in all_trades])
+    return {"symbols": pd.DataFrame(rows), "setups": pd.DataFrame(setups), "score_buckets": pd.DataFrame(buckets),
+            "trades": trades}
 
 
 __all__ = ["BacktestResult", "Trade", "run_backtest", "summarize"]

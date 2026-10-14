@@ -13,7 +13,8 @@ from math import isfinite
 
 import pandas as pd
 
-from analysis.strategy import BarDecision, StrategyConfig, TechnicalScore, classify_daily, evaluate_bar
+from analysis.strategy import (TRIGGER_LABELS, BarDecision, StrategyConfig, TechnicalScore, classify_daily,
+                               entry_limits, evaluate_bar)
 from data.normalize import session_schedule
 
 
@@ -230,14 +231,15 @@ def _unavailable_actions(reason: str, daily: BiasAssessment, intraday: BiasAsses
 _GATE_MARK = {"pass": "✓", "fail": "✗", "unknown": "？"}
 _GATE_NAMES = {
     "strict_trend": "严格多头排列", "rsi_range": "RSI 入场区间", "extension": "距 SMA20 不追高",
-    "trigger": "日线触发", "long_trend": "SMA200 长期趋势", "market_regime": "大盘环境（SPY）",
-    "earnings": "财报事件风险", "score": "综合评分",
+    "trigger": "日线触发", "reward_risk": "盈亏比（前高空间 ÷ 止损风险）", "long_trend": "SMA200 长期趋势",
+    "market_regime": "大盘环境（SPY）", "earnings": "财报事件风险", "score": "综合评分",
 }
 _GATE_WAIT = {
     "strict_trend": "等待日线收盘 > SMA20 > SMA50，且两条均线均较前一交易日上升。",
     "rsi_range": "等待已完成日线 RSI14 回到入场区间。",
     "extension": "价格离 SMA20 过远，等待回调后再考虑，避免追高。",
-    "trigger": "等待日线触发：重新站上 SMA20，或回踩 SMA20 后收盘突破前一日高点。",
+    "trigger": "等待日线触发：重新站上 SMA20、回踩 SMA20 后收盘突破前一日高点，或放量突破 60 日前高。",
+    "reward_risk": "上方前高的空间不足止损风险的要求倍数，等待回调到更低位置，或放量突破前高后再考虑。",
     "long_trend": "股价低于 SMA200，长期趋势未确认，暂不新开仓。",
     "market_regime": "SPY 低于其 SMA200，大盘处于弱势环境，暂不新开仓。",
     "earnings": "临近财报，波段持仓会承担财报跳空风险，等待财报公布后再评估。",
@@ -269,7 +271,7 @@ def _actions(daily: BiasAssessment, intraday: BiasAssessment, facts: dict | None
     if intra_facts is not None:
         intra_close = intra_facts["close"]
         intra_gap = (intra_close - sma20) / atr if atr else intra_close / sma20 - 1
-        limit = config.max_extension_atr if atr else config.fallback_max_extension
+        limit = entry_limits(config, decision.trigger)[1] if atr else config.fallback_max_extension
         gap_text = f"{intra_gap:+.2f} ATR" if atr else f"{intra_gap:+.2%}"
         conditions.append(f"盘中参考 {_time(intraday.as_of)}：已完成收盘 {intra_close:.2f}，距日线 SMA20 {gap_text}。")
         if intra_facts["current"] and intra_gap > limit:
@@ -279,21 +281,26 @@ def _actions(daily: BiasAssessment, intraday: BiasAssessment, facts: dict | None
     if intraday.code == "bullish" and daily.code in ("bearish", "strong_bearish"):
         conflicts.append("盘中偏多与日线偏空相冲突；盘中反弹不覆盖日线退出条件。")
     conditions.append(REFERENCE_NOTE)
+    rsi_high, max_extension = entry_limits(config, decision.trigger)
+    if decision.trigger:
+        conditions.insert(1, f"入场形态：{TRIGGER_LABELS[decision.trigger]}。")
     entry_invalidation = (
         f"后续已完成日线收盘跌回 SMA20（当前参考 {sma20:.2f}）下方，或严格多头排列消失。",
-        f"RSI14 离开 [{config.entry_rsi_low:g}, {config.entry_rsi_high:g})，或价格偏离 SMA20 超过 {config.max_extension_atr:g} ATR。",
+        f"RSI14 离开 [{config.entry_rsi_low:g}, {rsi_high:g})，或价格偏离 SMA20 超过 {max_extension:g} ATR。",
         "SPY 跌破其 SMA200、临近财报，或综合评分跌破入场门槛。",
     )
     if not blockers:
         attractiveness = "入场条件已满足"
-        entry = ActionGuidance("buy", "买入", "已完成日线的趋势、动量、位置、触发、大盘和综合评分均满足规则，可在当前或下一交易时段考虑入场。",
+        entry = ActionGuidance("buy", "买入", "已完成日线的趋势、动量、位置、触发、盈亏比、大盘和综合评分均满足规则，可在当前或下一交易时段考虑入场。",
                                TIMEFRAME, "已触发", tuple(conditions), entry_invalidation, tuple(conflicts))
     else:
         failed = {gate.name for gate in decision.gates if gate.status == "fail"}
-        if rsi >= config.entry_rsi_high:
+        if rsi >= rsi_high:
             attractiveness = "超买，等待入场条件"
         elif "extension" in failed:
             attractiveness = "偏离 SMA20 过远，等待回调"
+        elif "reward_risk" in failed:
+            attractiveness = "上方空间不足，等待更好的价格"
         elif "market_regime" in failed:
             attractiveness = "大盘弱势，暂缓新开仓"
         elif "earnings" in failed:
@@ -330,7 +337,6 @@ def evaluate_signals(
     daily_retrieved_at: datetime,
     intraday_retrieved_at: datetime | None = None,
     context: MarketContext | None = None,
-    support_resistance=None,
     config: StrategyConfig | None = None,
 ) -> TechnicalAssessment:
     """Return both position-independent market bias and two action contexts.
@@ -356,7 +362,7 @@ def evaluate_signals(
         intra_cutoff = min(local_now, _local(intraday_retrieved_at))
         intraday_bias, intra_facts = _intraday_bias(intraday, intra_cutoff, local_now, bool(market_open))
     decision = None if facts is None else evaluate_bar(
-        facts["prior"], facts["latest"], config, support_resistance=support_resistance,
+        facts["prior"], facts["latest"], config,
         next_earnings=context.next_earnings, earnings_checked=context.earnings_checked)
     attractiveness, entry, position = _actions(daily_bias, intraday_bias, facts, intra_facts, bool(market_open),
                                                expected, decision, config)

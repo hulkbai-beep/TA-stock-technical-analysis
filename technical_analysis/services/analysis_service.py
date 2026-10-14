@@ -12,7 +12,7 @@ from weakref import WeakKeyDictionary
 
 import pandas as pd
 
-from analysis.indicators import daily_indicators, session_vwap, visible_daily
+from analysis.indicators import RESISTANCE_LOOKBACKS, daily_indicators, session_vwap, visible_daily
 from analysis.summary import SummaryItem, generate_summaries
 from analysis.signals import MarketContext, TechnicalAssessment, evaluate_signals
 from analysis.strategy import attach_benchmarks
@@ -130,7 +130,6 @@ def assessment_for(result: AnalysisResult, now: datetime | None = None) -> Techn
         daily_retrieved_at=result.daily_retrieved_at,
         intraday_retrieved_at=result.intraday_retrieved_at,
         context=getattr(result, "context", None),
-        support_resistance=getattr(result, "support_resistance", None),
     )
 
 
@@ -167,7 +166,9 @@ def _previous_close(daily: pd.DataFrame, session: date) -> tuple[float | None, d
 
 
 _FEATURES = ("sma20", "sma50", "sma200", "rsi14", "ret63", "ret126", "atr14", "high22", "prev_high",
-             "pullback_atr5", "fib_high", "fib_low", "fib_up", "vol_avg20", "rel_volume", "updown_volume20")
+             *(f"prior_high{period}" for period in RESISTANCE_LOOKBACKS),
+             "pullback_atr5", "fib_high", "fib_low", "fib_up", "vol_avg20", "rel_volume", "updown_volume20",
+             "vol_ratio5_20")
 
 
 def calendar_indicators(daily: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -354,7 +355,7 @@ def analyze(
             daily, intraday, now=local_now.to_pydatetime(),
             daily_retrieved_at=daily_retrieved,
             intraday_retrieved_at=intraday_retrieved,
-            context=context, support_resistance=sr_result,
+            context=context,
         ),
         support_resistance=sr_result,
         context=context,

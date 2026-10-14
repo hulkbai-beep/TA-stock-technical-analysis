@@ -4,8 +4,7 @@ Usage (from the technical_analysis directory):
 
     python scripts/backtest.py                       # default symbol list, 6 years
     python scripts/backtest.py NVDA AAPL MSFT --years 8
-    python scripts/backtest.py --ablation            # also rerun with each gate removed
-    python scripts/backtest.py --with-sr NVDA        # include support/resistance (slow)
+    python scripts/backtest.py --ablation            # also rerun with each gate or setup removed
 
 Results print to the console and are saved as CSV files under
 `artifacts/backtest/`. No API key, URL or provider body is printed.
@@ -26,7 +25,6 @@ import pandas as pd  # noqa: E402
 
 from analysis.backtest import run_backtest, summarize  # noqa: E402
 from analysis.strategy import SECTOR_ETFS, StrategyConfig, attach_benchmarks  # noqa: E402
-from analysis.support_resistance.engine import analyze_support_resistance  # noqa: E402
 from config import load_settings  # noqa: E402
 from data.fmp_client import MARKET_BENCHMARK, FMPClient  # noqa: E402
 from data.normalize import normalize_daily  # noqa: E402
@@ -43,7 +41,10 @@ ABLATIONS = {
     "no SPY gate": {"use_market_gate": False},
     "no SMA200 gate": {"use_long_trend_gate": False},
     "no earnings gate": {"use_earnings_gate": False},
-    "no chandelier stop": {"chandelier_atr": 1e9},
+    "no reward/risk gate": {"use_reward_risk_gate": False},
+    "reward/risk >= 1": {"min_reward_risk": 1.0},
+    "no breakout setup": {"use_breakout_setup": False},
+    "no chandelier stop": {"use_chandelier_exit": False},
 }
 
 
@@ -91,8 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("symbols", nargs="*", help="US tickers (default: a 15-stock large-cap list)")
     parser.add_argument("--years", type=float, default=6.0, help="years of tested history (default 6)")
     parser.add_argument("--cost-bps", type=float, default=5.0, help="cost per side in basis points (default 5)")
-    parser.add_argument("--with-sr", action="store_true", help="recompute support/resistance each day (slow)")
-    parser.add_argument("--ablation", action="store_true", help="rerun with each gate removed")
+    parser.add_argument("--ablation", action="store_true", help="rerun with each gate or setup removed")
     arguments = parser.parse_args(argv)
     symbols = tuple(symbol.upper() for symbol in arguments.symbols) or DEFAULT_SYMBOLS
     settings = load_settings()
@@ -127,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
     if not prepared:
         print("No symbols could be loaded.")
         return 1
-    sr = (lambda history: analyze_support_resistance(history)) if arguments.with_sr else None
     output = PROJECT_DIR / "artifacts" / "backtest"
     output.mkdir(parents=True, exist_ok=True)
     pd.set_option("display.width", 160)
@@ -136,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, overrides in variants.items():
         config = replace(StrategyConfig(), **overrides)
         results = [run_backtest(symbol, frame, config, earnings_dates=earnings, cost_bps=arguments.cost_bps,
-                                support_resistance_for=sr, start=start)
+                                start=start)
                    for symbol, (frame, earnings, _) in prepared.items()]
         summary = summarize(results)
         symbols_table, trades = summary["symbols"], summary["trades"]
@@ -155,15 +154,19 @@ def main(argv: list[str] | None = None) -> int:
             print(_percent(symbols_table, ("win_rate", "avg_return", "median_return", "avg_win", "avg_loss",
                                            "strategy_return", "max_drawdown", "exposure", "buy_and_hold"))
                   .to_string(index=False, float_format=lambda value: f"{value:.2f}"))
+            print("\n=== Trades by entry setup ===")
+            print(_percent(summary["setups"], ("win_rate", "avg_return", "median_return", "avg_win", "avg_loss"))
+                  .to_string(index=False, float_format=lambda value: f"{value:.2f}"))
             print("\n=== Does a higher score predict better 10-session returns? ===")
             print(_percent(summary["score_buckets"], ("avg_10d_return", "hit_rate", "vs_all_bars"))
                   .to_string(index=False))
             symbols_table.to_csv(output / "symbols.csv", index=False)
             summary["score_buckets"].to_csv(output / "score_buckets.csv", index=False)
+            summary["setups"].to_csv(output / "setups.csv", index=False)
             trades.to_csv(output / "trades.csv", index=False)
     table = pd.DataFrame(comparison)
     if arguments.ablation:
-        print("\n=== Ablation: what each gate contributes ===")
+        print("\n=== Ablation: what each gate or setup contributes ===")
         print(_percent(table, ("win_rate", "avg_trade", "avg_strategy_return", "avg_buy_and_hold",
                                "avg_max_drawdown", "avg_exposure")).to_string(index=False))
         table.to_csv(output / "ablation.csv", index=False)

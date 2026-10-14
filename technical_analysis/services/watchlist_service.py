@@ -13,13 +13,13 @@ from datetime import date, datetime, timezone
 import logging
 from typing import Callable
 
-from analysis.strategy import Gate
+from analysis.strategy import SETUP_SHORT, Gate
 from models import DataError
 from services import analysis_service
 
 _GATE_SHORT = {
     "strict_trend": "趋势未成多头排列", "rsi_range": "RSI 不在入场区间", "extension": "离 SMA20 过远",
-    "trigger": "未出现日线触发", "long_trend": "低于 SMA200", "market_regime": "大盘弱势",
+    "trigger": "未出现日线触发", "reward_risk": "盈亏比不足", "long_trend": "低于 SMA200", "market_regime": "大盘弱势",
     "earnings": "临近财报", "score": "评分不足",
 }
 _LOG = logging.getLogger(__name__)
@@ -49,6 +49,8 @@ class WatchlistRow:
     stop_distance: float | None = None
     next_earnings: date | None = None
     relative_strength: float | None = None
+    setup: str | None = None
+    reward_risk: str | None = None
 
     def action(self, holding: bool) -> tuple[str, str, str]:
         if holding:
@@ -75,6 +77,17 @@ def summarize_result(result, analyzed_at: datetime) -> WatchlistRow:
         if own is not None and market is not None and own == own and market == market:
             relative = float(own) - float(market)
     chandelier = decision.chandelier if decision is not None else None
+    setup = SETUP_SHORT.get(decision.trigger) if decision is not None else None
+    rr = decision.reward_risk if decision is not None else None
+    close = None if latest is None else float(latest["close"])
+    if rr is None or close is None:
+        reward_risk = None
+    elif close <= rr.stop:
+        reward_risk = "止损下方"
+    elif rr.ratio is None:
+        reward_risk = "上方无前高"
+    else:
+        reward_risk = f"{rr.ratio:.1f}"
     price = result.snapshot.price
     if decision is None:
         entry_reason = position_reason = entry.explanation
@@ -95,6 +108,7 @@ def summarize_result(result, analyzed_at: datetime) -> WatchlistRow:
         chandelier=chandelier,
         stop_distance=None if chandelier is None or not price else (price - chandelier) / price,
         next_earnings=result.context.next_earnings, relative_strength=relative,
+        setup=setup, reward_risk=reward_risk,
     )
 
 

@@ -26,6 +26,8 @@ All are calculated over the calendar-reindexed history, so a missing session res
 | SMA200 | 200-session arithmetic mean of closes | long-term trend gate, trend score |
 | ATR14 | Wilder ATR: first 14 true ranges averaged, then `(prev*13 + TR)/14` | extension limit, location score, chandelier stop |
 | 22-session high | highest high of the last 22 sessions | chandelier stop |
+| Prior highs | highest high of the 20/60/126/252 sessions before today (today excluded) | reward/risk gate and score, breakout trigger |
+| 5/20 volume ratio | 5-session average volume ÷ 20-session average volume | breakout trigger |
 | Pullback depth | lowest `(low - SMA20)/ATR14` of the last 5 sessions | pullback trigger |
 | Up/down volume ratio | 20-session volume on up closes ÷ volume on down closes, capped at 5 | volume score |
 | Relative volume | volume ÷ average of the previous 20 sessions | displayed in the data table |
@@ -95,9 +97,9 @@ Earlier versions required a fresh Bullish intraday reading, no more than 10 minu
 | RSI momentum | 10% | 1.0 for RSI 55-65, linear to 0 at 40 and 80 |
 | Pullback location | 10% | 1.0 within 0-0.75 ATR above SMA20, linear to 0 at 2 ATR above or 0.5 ATR below; +0.25 within 0.5 ATR of a 38.2/50/61.8% retracement of an up leg |
 | Volume confirmation | 10% | up/down volume ratio: 0 at 0.8, 1 at 1.5 |
-| Reward/risk room | 10% | distance to the nearest resistance (4 ATR if none) ÷ distance to the nearest support (min 0.5 ATR) or the chandelier stop; 1:1 → 0, 3:1 → 1 |
+| Reward/risk room | 10% | (nearest prior high above the close − close) ÷ (close − chandelier stop); 1:1 → 0, 3:1 → 1; 1 when no prior high is above the close, 0 at or below the stop |
 
-Why these weights: trend and relative strength carry the most published evidence at multi-week horizons (time-series and cross-sectional momentum), so together they get 45%. Market regime is a strong filter but changes slowly, so it acts mostly as a gate and is 15% of the score. RSI, location and volume refine timing and get 10% each. Reward/risk room uses the support/resistance engine. MACD and Stochastics are deliberately absent: they largely restate RSI and moving-average information and would double-count it.
+Why these weights: trend and relative strength carry the most published evidence at multi-week horizons (time-series and cross-sectional momentum), so together they get 45%. Market regime is a strong filter but changes slowly, so it acts mostly as a gate and is 15% of the score. RSI, location and volume refine timing and get 10% each. Reward/risk room uses prior highs rather than the support/resistance zones so that the backtest can replay exactly the same rule bar by bar (recomputing zones every day took about 0.2 s per bar). MACD and Stochastics are deliberately absent: they largely restate RSI and moving-average information and would double-count it.
 
 Missing components are excluded and the remaining weights are renormalized; at least 50% of the configured weight must be calculable or the score is unavailable. Grades: ≥75 strong, ≥60 favorable, ≥40 neutral, otherwise weak. The score is a ranking aid, not a probability. The backtest's score-bucket table shows whether higher scores have actually preceded better returns; adjust the weights if they have not.
 
@@ -114,13 +116,18 @@ First check daily data adequacy and freshness for both holding states. If the co
 | Strict uptrend | required | `C > M20 > M50`, `d20 > 0`, `d50 > 0` |
 | RSI entry range | required | `50 <= R < 70` |
 | No chasing | required | `0 <= (C - M20)/ATR14 <= 1.5` (falls back to 0-3% when ATR is unavailable) |
-| Daily trigger | required | **SMA20 reclaim**: `P <= P20` and `C > M20`; or **pullback resumption**: `P > P20`, `C > M20`, the lowest low of the last 5 sessions came within 0.5 ATR of SMA20 (or below it), and `C` closed above the previous session's high |
+| Daily trigger | required | **Volume breakout**: `C` above the highest high of the previous 60 sessions, with 5-session average volume ≥ 1.5 × the 20-session average; or **SMA20 reclaim**: `P <= P20` and `C > M20`; or **pullback resumption**: `P > P20`, `C > M20`, the lowest low of the last 5 sessions came within 0.5 ATR of SMA20 (or below it), and `C` closed above the previous session's high |
+| Reward/risk | required | (nearest prior high above `C` − `C`) ÷ (`C` − chandelier stop) ≥ 2. Prior highs are the highest highs of the previous 20, 60, 126 and 252 sessions. Passes when `C` is above all of them; fails when `C` is at or below the stop; unverifiable without ATR, the 22-session high or any prior high |
 | Score | required | weighted score available and at least 60 |
 | Long-term trend | conditional | `C > SMA200` |
 | Market regime | conditional | SPY close > SPY SMA200 |
 | Earnings | conditional | no earnings report within the next 7 calendar days |
 
 Conditional gates block only when their data shows a failure. Missing data is shown as unverifiable rather than silently passed.
+
+When the trigger is a volume breakout, the RSI range widens to `50 <= R < 80` and the no-chasing limit to 3 ATR, because a genuine breakout runs hotter and further from SMA20 than a pullback; the panel labels these as breakout limits. The trigger shown first wins when several apply (breakout, then reclaim, then pullback). The entry setup is listed in the panel and in the watchlist's 入场形态 column.
+
+The reward/risk gate stops a Buy just below an obvious ceiling: when the nearest prior high leaves less than twice the room of the drop to the trailing stop, the trade is skewed the wrong way even if every trend condition holds. It uses the chandelier stop as the risk because that is the exit the rules actually use.
 
 The old "rising continuation" trigger (any up close above SMA20 in an uptrend) fired on most days of a trend, so it was not really a trigger. Pullback resumption requires an actual test of the average followed by a close above the prior high. The old fixed 3% extension limit treated a utility and a semiconductor stock alike; the ATR limit scales with each stock's volatility.
 
@@ -158,10 +165,10 @@ These conditions describe when to reassess. The chandelier level is a rule-based
 .\.venv\Scripts\python scripts\backtest.py NVDA AAPL MSFT --years 8 --ablation
 ```
 
-Each decision uses only completed bars up to that session. Orders fill at the next session's open with a per-side cost (default 5 bps). Reduce sells half, Sell closes the rest. The report shows, per symbol, trade count, win rate, average/median trade, profit factor, strategy return, max drawdown, time in market and buy-and-hold return. It also buckets every session by score and reports the average 10-session forward return per bucket, which shows whether a higher score has actually preceded better returns. `--ablation` reruns the test with each gate removed (score, SPY, SMA200, earnings, chandelier stop) so you can see what each one contributes. `--with-sr` recomputes support/resistance each day so the reward/risk component is included; it is slow. CSV files are written to `artifacts/backtest/`.
+Each decision uses only completed bars up to that session. Orders fill at the next session's open with a per-side cost (default 5 bps). Reduce sells half, Sell closes the rest. The report shows, per symbol, trade count, win rate, average/median trade, profit factor, strategy return, max drawdown, time in market and buy-and-hold return. It also buckets every session by score and reports the average 10-session forward return per bucket, which shows whether a higher score has actually preceded better returns. A per-setup table splits the trades by entry trigger (volume breakout, SMA20 reclaim, pullback). `--ablation` reruns the test with each gate or setup removed (score, SPY, SMA200, earnings, reward/risk, breakout setup, chandelier stop) plus a looser reward/risk ≥ 1 variant, so you can see what each one contributes. CSV files are written to `artifacts/backtest/`.
 
 Limits: the default symbol list is today's large caps, so results carry survivorship bias. The test ignores slippage beyond the cost, overnight gaps through a stop, taxes and position sizing. Treat it as a check on whether the rules behave sensibly, not a forecast.
 
 ## Focused verification
 
-`tests/test_signals.py` uses isolated synthetic fixtures to cover bullish, bearish, conflicting, overbought-uptrend, insufficient/stale daily, unavailable intraday, provisional-bar, pullback-trigger, market-gate, earnings-gate, SMA200, score, Reduce and chandelier cases. It also checks that holding status selects different guidance without changing the shared market assessment. `tests/test_strategy.py` covers ATR, Fibonacci legs, volume ratios, gap handling, benchmark alignment, the context fetch, held/failed zone tests and a no-look-ahead backtest check; `tests/test_backtest_script.py` runs the backtest command offline. Fixtures verify implementation against the rules; they measure neither historical trading performance nor prediction accuracy.
+`tests/test_signals.py` uses isolated synthetic fixtures to cover bullish, bearish, conflicting, overbought-uptrend, insufficient/stale daily, unavailable intraday, provisional-bar, pullback-trigger, reward/risk, market-gate, earnings-gate, SMA200, score, Reduce and chandelier cases. It also checks that holding status selects different guidance without changing the shared market assessment. `tests/test_strategy.py` covers ATR, Fibonacci legs, volume ratios, prior highs, the breakout trigger and its limits, the reward/risk gate, gap handling, benchmark alignment, the context fetch, held/failed zone tests and a no-look-ahead backtest check; `tests/test_backtest_script.py` runs the backtest command offline. Fixtures verify implementation against the rules; they measure neither historical trading performance nor prediction accuracy.

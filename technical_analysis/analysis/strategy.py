@@ -14,7 +14,7 @@ import math
 
 import pandas as pd
 
-from analysis.indicators import daily_indicators
+from analysis.indicators import BREAKOUT_LOOKBACK, RESISTANCE_LOOKBACKS, daily_indicators
 
 
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
@@ -59,15 +59,41 @@ class StrategyConfig:
     min_score_coverage: float = 0.5
     fib_proximity_atr: float = 0.5
     rs_full_scale: float = 0.10
+    breakout_volume_ratio: float = 1.5
+    breakout_rsi_high: float = 80.0
+    breakout_max_extension_atr: float = 3.0
+    min_reward_risk: float = 2.0
+    use_breakout_setup: bool = True
+    use_reward_risk_gate: bool = True
     use_long_trend_gate: bool = True
     use_market_gate: bool = True
     use_earnings_gate: bool = True
+    use_chandelier_exit: bool = True
     weights: ScoreWeights = field(default_factory=ScoreWeights)
+
+
+TRIGGER_LABELS = {
+    "breakout": f"放量突破 {BREAKOUT_LOOKBACK} 日前高",
+    "reclaim": "重新站上 SMA20",
+    "pullback": "回踩 SMA20 后突破前一日高点",
+}
+SETUP_SHORT = {"breakout": "放量突破", "reclaim": "站回 SMA20", "pullback": "回踩"}
+
+
+def entry_limits(config: StrategyConfig, trigger: str | None) -> tuple[float, float]:
+    """RSI ceiling and maximum ATR distance above SMA20 for this setup.
+
+    A breakout is expected to run hotter and further from SMA20 than a
+    pullback entry, so it gets its own (wider) limits.
+    """
+    if trigger == "breakout":
+        return config.breakout_rsi_high, config.breakout_max_extension_atr
+    return config.entry_rsi_high, config.max_extension_atr
 
 
 SCORE_LABELS = {
     "trend": "趋势结构", "relative_strength": "相对强度", "market_regime": "大盘环境",
-    "momentum": "RSI 动量", "location": "回调位置", "volume": "量价配合", "reward_risk": "盈亏空间",
+    "momentum": "RSI 动量", "location": "回调位置", "volume": "量价配合", "reward_risk": "盈亏比",
 }
 
 
@@ -107,6 +133,20 @@ class FibLevels:
 
 
 @dataclass(frozen=True)
+class RewardRisk:
+    """Room to the nearest prior high above the close versus the drop to the stop.
+
+    `resistance` is None when the close is above every prior high checked
+    (`checked` sessions back); `ratio` is then None as well.
+    """
+    stop: float
+    resistance: float | None
+    lookback: int | None
+    checked: int
+    ratio: float | None
+
+
+@dataclass(frozen=True)
 class BarDecision:
     daily_code: str
     strict_up: bool
@@ -119,6 +159,7 @@ class BarDecision:
     score: TechnicalScore
     fib: FibLevels | None
     chandelier: float | None
+    reward_risk: RewardRisk | None = None
 
 
 def _num(row, name: str) -> float | None:
@@ -183,13 +224,24 @@ def classify_daily(prior, latest, config: StrategyConfig) -> tuple[str, bool, bo
     return "neutral", strict_up, strict_down
 
 
-def nearest_levels(support_resistance, price: float) -> tuple[float | None, float | None]:
-    """Upper edge of the nearest valid support below and lower edge of resistance above."""
-    if support_resistance is None or not getattr(support_resistance, "available", False):
-        return None, None
-    supports = [zone.upper for zone in support_resistance.supports if zone.upper < price]
-    resistances = [zone.lower for zone in support_resistance.resistances if zone.lower > price]
-    return (max(supports) if supports else None), (min(resistances) if resistances else None)
+def reward_risk(latest, chandelier: float | None) -> RewardRisk | None:
+    """Nearest prior high above the close (20/60/126/252 sessions) against the chandelier stop.
+
+    Prior highs are the resistance here, rather than the support/resistance
+    zones, so the backtest can evaluate exactly the same rule bar by bar.
+    """
+    close = _num(latest, "close")
+    known = [(period, _num(latest, f"prior_high{period}")) for period in RESISTANCE_LOOKBACKS]
+    known = [(period, level) for period, level in known if level is not None]
+    if close is None or chandelier is None or not known:
+        return None
+    checked = max(period for period, _ in known)
+    above = [(period, level) for period, level in known if level > close]
+    if not above:
+        return RewardRisk(chandelier, None, None, checked, None)
+    lookback, level = min(above, key=lambda item: item[1])
+    risk = close - chandelier
+    return RewardRisk(chandelier, level, lookback, checked, (level - close) / risk if risk > 0 else 0.0)
 
 
 def _trend_value(prior, latest) -> tuple[float | None, str]:
@@ -277,26 +329,32 @@ def _volume_value(latest) -> tuple[float | None, str]:
     return _clip((ratio - 0.8) / 0.7), f"20 日上涨日/下跌日成交量比 {ratio:.2f}"
 
 
-def _reward_risk_value(latest, support_resistance, chandelier: float | None) -> tuple[float | None, str]:
-    close, atr = _num(latest, "close"), _num(latest, "atr14")
-    if close is None or atr is None or atr <= 0 or support_resistance is None:
-        return None, "支撑/阻力不可用"
-    support, resistance = nearest_levels(support_resistance, close)
-    reward = (resistance - close) if resistance is not None else 4 * atr
-    if support is not None:
-        risk = max(close - support, 0.5 * atr)
-    elif chandelier is not None and chandelier < close:
-        risk = close - chandelier
+def describe_reward_risk(latest, rr: RewardRisk | None) -> str:
+    if rr is None:
+        return "缺少 ATR、22 日最高价或前高数据"
+    close = _num(latest, "close")
+    if close is not None and close <= rr.stop:
+        return f"收盘 {close:.2f} 已在吊灯止损 {rr.stop:.2f} 下方"
+    if rr.resistance is None:
+        return f"收盘高于近 {rr.checked} 个交易日的所有前高，上方无前高阻力；吊灯止损 {rr.stop:.2f}"
+    return f"上方前高 {rr.resistance:.2f}（近 {rr.lookback} 日），吊灯止损 {rr.stop:.2f}，盈亏比 {rr.ratio:.2f}"
+
+
+def _reward_risk_value(latest, rr: RewardRisk | None) -> tuple[float | None, str]:
+    if rr is None:
+        return None, describe_reward_risk(latest, rr)
+    close = _num(latest, "close")
+    if close is not None and close <= rr.stop:
+        value = 0.0
+    elif rr.ratio is None:
+        value = 1.0
     else:
-        return None, "下方没有可用支撑"
-    ratio = reward / risk
-    where = f"上方阻力 {resistance:.2f}" if resistance is not None else "上方无阻力（按 4 ATR）"
-    below = f"下方支撑 {support:.2f}" if support is not None else f"吊灯止损 {chandelier:.2f}"
-    return _clip((ratio - 1) / 2), f"{where}，{below}，空间/风险 {ratio:.2f}"
+        value = _clip((rr.ratio - 1) / 2)
+    return value, describe_reward_risk(latest, rr)
 
 
-def technical_score(prior, latest, config: StrategyConfig, support_resistance=None,
-                    fib: FibLevels | None = None, chandelier: float | None = None) -> TechnicalScore:
+def technical_score(prior, latest, config: StrategyConfig, fib: FibLevels | None = None,
+                    chandelier: float | None = None) -> TechnicalScore:
     raw = {
         "trend": _trend_value(prior, latest),
         "relative_strength": _relative_strength_value(latest, config),
@@ -304,7 +362,7 @@ def technical_score(prior, latest, config: StrategyConfig, support_resistance=No
         "momentum": _momentum_value(latest),
         "location": _location_value(latest, fib, config),
         "volume": _volume_value(latest),
-        "reward_risk": _reward_risk_value(latest, support_resistance, chandelier),
+        "reward_risk": _reward_risk_value(latest, reward_risk(latest, chandelier)),
     }
     weights = vars(config.weights)
     total = math.fsum(weights.values())
@@ -323,7 +381,7 @@ def technical_score(prior, latest, config: StrategyConfig, support_resistance=No
     return TechnicalScore(score, coverage, grade, tuple(components))
 
 
-def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *, support_resistance=None,
+def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *,
                  next_earnings: date | None = None, earnings_checked: bool = False) -> BarDecision:
     """Apply the entry gates, exit rules and score to two consecutive completed bars.
 
@@ -346,23 +404,51 @@ def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *, support
     prev_high, pullback = _num(latest, "prev_high"), _num(latest, "pullback_atr5")
     resumed = (prior_close > prior_sma20 and close > sma20 and prev_high is not None and close > prev_high
                and pullback is not None and pullback <= config.pullback_touch_atr)
-    trigger = "reclaim" if reclaim else "pullback" if resumed else None
+    breakout_level, volume_ratio = _num(latest, f"prior_high{BREAKOUT_LOOKBACK}"), _num(latest, "vol_ratio5_20")
+    breakout = (config.use_breakout_setup and breakout_level is not None and volume_ratio is not None
+                and close > breakout_level and volume_ratio >= config.breakout_volume_ratio)
+    trigger = "breakout" if breakout else "reclaim" if reclaim else "pullback" if resumed else None
+    rsi_high, max_extension = entry_limits(config, trigger)
 
     gates = [Gate("strict_trend", "pass" if strict_up else "fail", True,
                   "收盘 > SMA20 > SMA50，且两条均线均上升")]
-    gates.append(Gate("rsi_range", "pass" if config.entry_rsi_low <= rsi < config.entry_rsi_high else "fail", True,
-                      f"RSI14 {rsi:.2f}，需在 [{config.entry_rsi_low:g}, {config.entry_rsi_high:g})"))
+    gates.append(Gate("rsi_range", "pass" if config.entry_rsi_low <= rsi < rsi_high else "fail", True,
+                      f"RSI14 {rsi:.2f}，需在 [{config.entry_rsi_low:g}, {rsi_high:g})"
+                      + ("（突破形态上限）" if trigger == "breakout" else "")))
     if atr is not None:
         extension = (close - sma20) / atr
-        gates.append(Gate("extension", "pass" if 0 <= extension <= config.max_extension_atr else "fail", True,
-                          f"距 SMA20 {extension:+.2f} ATR，需在 0–{config.max_extension_atr:g} ATR"))
+        gates.append(Gate("extension", "pass" if 0 <= extension <= max_extension else "fail", True,
+                          f"距 SMA20 {extension:+.2f} ATR，需在 0–{max_extension:g} ATR"
+                          + ("（突破形态上限）" if trigger == "breakout" else "")))
     else:
         extension = close / sma20 - 1
         gates.append(Gate("extension", "pass" if 0 <= extension <= config.fallback_max_extension else "fail", True,
                           f"距 SMA20 {extension:+.2%}（ATR 不可用，按 {config.fallback_max_extension:.0%} 上限）"))
-    gates.append(Gate("trigger", "pass" if trigger else "fail", True,
-                      {"reclaim": "重新站上 SMA20", "pullback": "回踩 SMA20 后收盘突破前一日高点"}.get(
-                          trigger, "等待重新站上 SMA20，或回踩 SMA20 后收盘突破前一日高点")))
+    if trigger == "breakout":
+        trigger_detail = (f"收盘 {close:.2f} 突破前 {BREAKOUT_LOOKBACK} 日最高价 {breakout_level:.2f}，"
+                          f"5 日均量为 20 日均量的 {volume_ratio:.2f} 倍")
+    elif trigger:
+        trigger_detail = TRIGGER_LABELS[trigger]
+    else:
+        waiting = ["重新站上 SMA20", "回踩 SMA20 后收盘突破前一日高点"]
+        if config.use_breakout_setup:
+            waiting.append(f"放量（5 日均量 ≥ {config.breakout_volume_ratio:g} × 20 日均量）突破 {BREAKOUT_LOOKBACK} 日前高")
+        trigger_detail = "等待" + "、".join(waiting[:-1]) + "，或" + waiting[-1]
+    gates.append(Gate("trigger", "pass" if trigger else "fail", True, trigger_detail))
+    rr = reward_risk(latest, chandelier)
+    if config.use_reward_risk_gate:
+        if rr is None:
+            rr_status = "unknown"
+        elif close <= rr.stop:
+            rr_status = "fail"
+        elif rr.ratio is None:
+            rr_status = "pass"
+        else:
+            rr_status = "pass" if rr.ratio >= config.min_reward_risk else "fail"
+        rr_detail = describe_reward_risk(latest, rr)
+        if rr is not None and rr.ratio is not None and close > rr.stop:
+            rr_detail += f"，需至少 {config.min_reward_risk:g}"
+        gates.append(Gate("reward_risk", rr_status, True, rr_detail))
     sma200 = _num(latest, "sma200")
     if config.use_long_trend_gate:
         gates.append(Gate("long_trend", "unknown" if sma200 is None else "pass" if close > sma200 else "fail", False,
@@ -386,7 +472,7 @@ def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *, support
         inside = 0 <= days <= config.earnings_blackout_days
         gates.append(Gate("earnings", "fail" if inside else "pass", False,
                           f"下次财报 {next_earnings}（距 {days} 个自然日；{config.earnings_blackout_days} 日内不新开仓）"))
-    score = technical_score(prior, latest, config, support_resistance, fib, chandelier)
+    score = technical_score(prior, latest, config, fib, chandelier)
     gates.append(Gate("score", "unknown" if score.score is None else
                       "pass" if score.score >= config.buy_min_score else "fail", True,
                       "综合评分不可用" if score.score is None else
@@ -398,7 +484,7 @@ def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *, support
         sell_reasons.append("日线判断转为偏空")
     if prior_close < prior_sma50 and close < sma50:
         sell_reasons.append("连续两日收盘低于 SMA50")
-    if chandelier is not None and close < chandelier:
+    if config.use_chandelier_exit and chandelier is not None and close < chandelier:
         sell_reasons.append(f"收盘 {close:.2f} 跌破吊灯止损 {chandelier:.2f}（22 日最高价 − {config.chandelier_atr:g} ATR）")
     if sell_reasons:
         exit_kind, reasons = "sell", sell_reasons
@@ -407,9 +493,10 @@ def evaluate_bar(prior, latest, config: StrategyConfig | None = None, *, support
     else:
         exit_kind, reasons = None, []
     return BarDecision(code, strict_up, strict_down, trigger, tuple(gates), buy, exit_kind,
-                       tuple(reasons), score, fib, chandelier)
+                       tuple(reasons), score, fib, chandelier, rr)
 
 
-__all__ = ["BarDecision", "FibLevels", "Gate", "SECTOR_ETFS", "ScoreComponent", "ScoreWeights",
-           "StrategyConfig", "TechnicalScore", "attach_benchmarks", "classify_daily", "evaluate_bar",
-           "fib_levels", "nearest_levels", "technical_score"]
+__all__ = ["BarDecision", "FibLevels", "Gate", "RewardRisk", "SECTOR_ETFS", "SETUP_SHORT", "ScoreComponent",
+           "ScoreWeights", "StrategyConfig", "TRIGGER_LABELS", "TechnicalScore", "attach_benchmarks",
+           "classify_daily", "describe_reward_risk", "entry_limits", "evaluate_bar", "fib_levels", "reward_risk",
+           "technical_score"]

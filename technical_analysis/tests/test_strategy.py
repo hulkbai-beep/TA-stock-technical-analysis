@@ -8,8 +8,8 @@ import pytest
 
 from analysis.backtest import run_backtest, summarize
 from analysis.indicators import daily_indicators, wilder_atr
-from analysis.strategy import (StrategyConfig, attach_benchmarks, evaluate_bar, fib_levels,
-                               nearest_levels, technical_score)
+from analysis.strategy import (StrategyConfig, attach_benchmarks, entry_limits, evaluate_bar, fib_levels,
+                               reward_risk, technical_score)
 from analysis.support_resistance.engine import _historical_interactions
 from analysis.support_resistance.models import CandidateZone, SRConfig
 from config import Settings
@@ -85,21 +85,103 @@ def test_benchmarks_ignore_forming_bars():
     assert attached["sec_ret63"].isna().all()
 
 
-def test_reward_risk_uses_nearest_zones():
-    class Zone:
-        def __init__(self, lower, upper):
-            self.lower, self.upper = lower, upper
+def _row(**values):
+    return pd.Series(values, dtype=float)
 
-    class Result:
-        available = True
-        supports = (Zone(90, 92), Zone(95, 97))
-        resistances = (Zone(110, 112), Zone(105, 107))
 
-    assert nearest_levels(Result(), 100) == (97, 105)
-    row = pd.Series({"close": 100.0, "atr14": 2.0})
-    score = technical_score(row, row, StrategyConfig(), Result())
-    reward = next(item for item in score.components if item.name == "reward_risk")
-    assert reward.value == pytest.approx((5 / 3 - 1) / 2)
+def test_prior_highs_and_volume_ratio_exclude_today():
+    count = 70
+    high = pd.Series(np.r_[np.full(count - 1, 100.0), 130.0])
+    volume = pd.Series(np.r_[np.full(count - 5, 1000.0), np.full(5, 2000.0)])
+    frame = pd.DataFrame({"close": high - 1, "high": high, "low": high - 2, "volume": volume})
+    row = daily_indicators(frame).iloc[-1]
+    assert row["prior_high20"] == row["prior_high60"] == 100.0
+    assert np.isnan(row["prior_high126"]) and np.isnan(row["prior_high252"])
+    assert row["vol_ratio5_20"] == pytest.approx(2000 / 1250)
+
+
+def test_reward_risk_measures_to_the_nearest_prior_high_above():
+    row = _row(close=100.0, atr14=2.0, prior_high20=99.0, prior_high60=106.0, prior_high126=110.0, prior_high252=120.0)
+    rr = reward_risk(row, 97.0)
+    assert (rr.resistance, rr.lookback, rr.ratio) == (106.0, 60, pytest.approx(2.0))
+    score = technical_score(row, row, StrategyConfig(), chandelier=97.0)
+    component = next(item for item in score.components if item.name == "reward_risk")
+    assert component.value == pytest.approx(0.5)
+    assert "106.00" in component.detail and "60" in component.detail
+
+
+def test_reward_risk_without_resistance_or_stop():
+    clear = _row(close=130.0, prior_high20=120.0, prior_high60=125.0, prior_high126=np.nan, prior_high252=np.nan)
+    rr = reward_risk(clear, 120.0)
+    assert rr.resistance is None and rr.ratio is None and rr.checked == 60
+    score = technical_score(clear, clear, StrategyConfig(), chandelier=120.0)
+    assert next(item for item in score.components if item.name == "reward_risk").value == 1.0
+    assert reward_risk(clear, None) is None
+    assert reward_risk(_row(close=100.0), 95.0) is None
+
+
+def _setup_rows(**latest):
+    """Two bars in a strict uptrend; latest fields can be overridden per test."""
+    prior = _row(close=100.0, sma20=95.8, sma50=95.0)
+    values = dict(close=101.0, sma20=99.5, sma50=95.5, rsi14=60.0, atr14=2.0, high22=102.0, prev_high=100.5,
+                  pullback_atr5=0.3, prior_high20=102.0, prior_high60=102.0, prior_high126=110.0,
+                  prior_high252=120.0, vol_ratio5_20=1.0)
+    values.update(latest)
+    return prior, _row(**values)
+
+
+def _gate(decision, name):
+    return next(gate for gate in decision.gates if gate.name == name)
+
+
+def test_reward_risk_gate_blocks_entries_too_close_to_a_prior_high():
+    # Stop 102 - 3*2 = 96, risk 5; the 20-day high at 102 leaves only 1 of upside.
+    prior, latest = _setup_rows()
+    decision = evaluate_bar(prior, latest)
+    assert decision.trigger == "pullback"
+    gate = _gate(decision, "reward_risk")
+    assert gate.status == "fail" and gate.required and "0.20" in gate.detail
+    assert decision.reward_risk.resistance == 102.0
+    assert not decision.buy
+    # Above the 20/60-day highs the next one is the 126-day high at 112: 11 / 5 = 2.2.
+    prior, latest = _setup_rows(prior_high20=100.9, prior_high60=100.9, prior_high126=112.0)
+    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "pass"
+    prior, latest = _setup_rows(prior_high20=100.9, prior_high60=100.9, prior_high126=np.nan, prior_high252=np.nan)
+    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "pass"
+    prior, latest = _setup_rows(atr14=np.nan)
+    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "unknown"
+    prior, latest = _setup_rows()
+    assert "reward_risk" not in {gate.name for gate in
+                                 evaluate_bar(prior, latest, StrategyConfig(use_reward_risk_gate=False)).gates}
+
+
+def test_volume_breakout_gets_its_own_trigger_and_wider_limits():
+    # Close 101 above the 60-day high 100 on 1.8x volume, RSI 76, 2.5 ATR above SMA20.
+    hot = dict(sma20=96.0, rsi14=76.0, prior_high20=100.0, prior_high60=100.0, prior_high126=113.0,
+               vol_ratio5_20=1.8)
+    prior, latest = _setup_rows(**hot)
+    decision = evaluate_bar(prior, latest)
+    assert decision.trigger == "breakout"
+    assert {name: _gate(decision, name).status for name in ("rsi_range", "extension", "trigger", "reward_risk")} == \
+        {"rsi_range": "pass", "extension": "pass", "trigger": "pass", "reward_risk": "pass"}
+    assert "1.80" in _gate(decision, "trigger").detail
+    assert entry_limits(StrategyConfig(), "breakout") == (80.0, 3.0)
+    assert entry_limits(StrategyConfig(), "pullback") == (70.0, 1.5)
+    # Without enough volume the same bar is an ordinary pullback, too hot and too extended.
+    prior, latest = _setup_rows(**{**hot, "vol_ratio5_20": 1.2})
+    quiet = evaluate_bar(prior, latest)
+    assert quiet.trigger == "pullback"
+    assert (_gate(quiet, "rsi_range").status, _gate(quiet, "extension").status) == ("fail", "fail")
+    prior, latest = _setup_rows(**hot)
+    assert evaluate_bar(prior, latest, StrategyConfig(use_breakout_setup=False)).trigger == "pullback"
+
+
+def test_chandelier_exit_can_be_switched_off_for_the_ablation():
+    prior, latest = _setup_rows(high22=110.0)  # stop 110 - 3*2 = 104 is above the close
+    assert any("吊灯止损" in reason for reason in evaluate_bar(prior, latest).exit_reasons)
+    relaxed = evaluate_bar(prior, latest, StrategyConfig(use_chandelier_exit=False))
+    assert not any("吊灯止损" in reason for reason in relaxed.exit_reasons)
+    assert relaxed.chandelier == pytest.approx(104.0)
 
 
 def test_disabled_gates_are_omitted():
@@ -133,7 +215,11 @@ def test_backtest_summary_reports_trades_and_score_buckets():
     summary = summarize(results)
     assert summary["symbols"].iloc[0]["trades"] == len(results[0].trades)
     assert summary["score_buckets"]["observations"].sum() > 100
-    assert set(summary["trades"].columns) >= {"entry_session", "exit_session", "weighted_return", "exit_reason"}
+    assert set(summary["trades"].columns) >= {"entry_session", "exit_session", "weighted_return", "exit_reason", "setup"}
+    setups = summary["setups"]
+    assert list(setups["setup"]) == ["放量突破", "站回 SMA20", "回踩"]
+    assert setups["trades"].sum() == len(results[0].trades)
+    assert all(trade.setup in {"breakout", "reclaim", "pullback"} for trade in results[0].trades)
 
 
 def test_support_tests_record_whether_the_zone_held():

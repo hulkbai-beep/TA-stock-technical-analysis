@@ -9,6 +9,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from analysis.strategy import RewardRisk
 from config import Settings
 from data import normalize
 from data.fmp_client import FMPClient
@@ -123,6 +124,23 @@ def test_row_switches_between_entry_and_holding_guidance_without_new_data():
     assert row.action(False)[2] and row.action(True)[2]
 
 
+def test_row_reports_the_entry_setup_and_reward_to_risk():
+    client, _ = _offline_client(["NVDA"])
+    result = analysis_service.analyze("NVDA", client, now=NOW, include_intraday=False)
+    close = float(result.daily.loc[result.daily["complete"].astype(bool)].iloc[-1]["close"])
+
+    def row_for(trigger, rr):
+        decision = replace(result.assessment.decision, trigger=trigger, reward_risk=rr)
+        return summarize_result(replace(result, assessment=replace(result.assessment, decision=decision)), NOW)
+
+    row = row_for("breakout", RewardRisk(close - 5, close + 12, 126, 252, 2.4))
+    assert (row.setup, row.reward_risk) == ("放量突破", "2.4")
+    assert row_for("pullback", RewardRisk(close - 5, None, None, 252, None)).reward_risk == "上方无前高"
+    below = row_for(None, RewardRisk(close + 1, close + 5, 20, 252, 0.0))
+    assert (below.setup, below.reward_risk) == (None, "止损下方")
+    assert row_for("reclaim", None).reward_risk is None
+
+
 def test_unexpected_failure_names_the_error_and_logs_the_traceback(monkeypatch, caplog):
     def stale_analyze(symbol, client, now=None, refresh=False):  # an older signature
         raise AssertionError("never called with these arguments")
@@ -164,7 +182,7 @@ def test_home_loads_every_ticker_once_and_shows_a_sorted_table(monkeypatch):
     assert sorted(calls) == sorted((symbol, False, False) for symbol in DEFAULT_SYMBOLS)
     table = app.dataframe[0].value
     assert list(table["代码"]) == sorted(DEFAULT_SYMBOLS)
-    assert {"操作参考", "综合评分", "主要原因", "距吊灯止损 %", "下次财报"} <= set(table.columns)
+    assert {"操作参考", "综合评分", "入场形态", "盈亏比", "主要原因", "距吊灯止损 %", "下次财报"} <= set(table.columns)
     app.run(timeout=30)
     assert len(calls) == len(DEFAULT_SYMBOLS), "a rerun must reuse the session's rows"
 

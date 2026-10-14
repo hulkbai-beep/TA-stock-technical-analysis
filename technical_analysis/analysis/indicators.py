@@ -4,6 +4,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# Prior highs act as overhead resistance; the 60-session one also defines a breakout.
+RESISTANCE_LOOKBACKS = (20, 60, 126, 252)
+BREAKOUT_LOOKBACK = 60
+
 
 def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """Seed with the first `period` deltas, then apply Wilder recursion.
@@ -129,6 +133,8 @@ def daily_indicators(frame: pd.DataFrame, fib_lookback: int = 126) -> pd.DataFra
         result["atr14"] = wilder_atr(result["high"], result["low"], close)
         result["high22"] = result["high"].rolling(22, min_periods=22).max()
         result["prev_high"] = result["high"].shift(1)
+        for period in RESISTANCE_LOOKBACKS:
+            result[f"prior_high{period}"] = result["high"].shift(1).rolling(period, min_periods=period).max()
         result["pullback_atr5"] = ((result["low"] - result["sma20"]) / result["atr14"]).rolling(5, min_periods=5).min()
         leg = _fibonacci_leg(result["high"], result["low"], fib_lookback)
         for column in leg.columns:
@@ -137,6 +143,8 @@ def daily_indicators(frame: pd.DataFrame, fib_lookback: int = 126) -> pd.DataFra
         volume = pd.to_numeric(result["volume"], errors="coerce")
         result["vol_avg20"] = volume.shift(1).rolling(20, min_periods=20).mean()
         result["rel_volume"] = volume / result["vol_avg20"].where(result["vol_avg20"] > 0)
+        average20 = volume.rolling(20, min_periods=20).mean()
+        result["vol_ratio5_20"] = volume.rolling(5, min_periods=5).mean() / average20.where(average20 > 0)
         change = close.diff()
         up = volume.where(change > 0, 0.0).where(change.notna())
         down = volume.where(change < 0, 0.0).where(change.notna())

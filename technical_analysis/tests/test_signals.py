@@ -30,6 +30,10 @@ def _daily():
         "high22": [102.0, 102.0],
         "prev_high": [100.2, 100.8],
         "pullback_atr5": [0.1, 0.2],
+        "prior_high20": [100.9, 100.9],
+        "prior_high60": [100.9, 100.9],
+        "prior_high126": [120.0, 120.0],
+        "prior_high252": [125.0, 125.0],
         "updown_volume20": [1.4, 1.4],
         "ret63": [0.12, 0.12],
         "ret126": [0.20, 0.20],
@@ -359,11 +363,23 @@ def test_low_score_blocks_entry():
     daily["updown_volume20"] = [0.5, 0.5]
     daily["mkt_sma50"] = [480.0, 460.0]
     daily["rsi14"] = [51.0, 52.0]
+    daily["prior_high126"] = [111.0, 111.0]
 
     result = _assess(daily)
 
     assert result.score.score < 60
+    assert {gate.name: gate.status for gate in result.decision.gates}["reward_risk"] == "pass"
     assert result.entry.code == "wait"
+
+
+def test_entry_too_close_to_a_prior_high_waits_for_room():
+    daily = _daily()
+    daily["prior_high126"] = [104.0, 104.0]
+
+    result = _assess(daily)
+
+    assert result.entry.code == "wait"
+    assert any("盈亏比" in item for item in result.entry.conditions)
 
 
 def test_score_weights_sum_and_breakdown_are_reported():

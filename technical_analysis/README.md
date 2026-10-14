@@ -34,7 +34,7 @@ The default host is the official FMP API and uses its query-parameter authentica
 
 ## Watchlist home page
 
-The home page lists every saved ticker with its action (Buy/Wait, or Hold/Reduce/Sell for tickers marked as held), weighted score, daily bias, latest price and change, the main reason behind the action, distance to the chandelier stop, 3-month strength against SPY, and the next earnings date. It is sorted by score; clicking a row opens that ticker on the 个股分析 page with its held state.
+The home page lists every saved ticker with its action (Buy/Wait, or Hold/Reduce/Sell for tickers marked as held), weighted score, entry setup (回踩, 站回 SMA20 or 放量突破), reward/risk to the nearest prior high, daily bias, latest price and change, the main reason behind the action, distance to the chandelier stop, 3-month strength against SPY, and the next earnings date. It is sorted by score; clicking a row opens that ticker on the 个股分析 page with its held state.
 
 - **＋ 添加股票** adds a ticker (validated, no duplicates, up to 50) and analyzes just that ticker.
 - **↻ 刷新全部** re-fetches every ticker, bypassing caches.
@@ -51,7 +51,7 @@ The list is saved in `watchlist.json` next to `.env` (set `WATCHLIST_FILE` to mo
 - A prominent technical assessment with separate daily strength, RSI momentum, intraday bias, a weighted 0-100 technical score with its breakdown, conditional action guidance, every entry gate, supporting/conflicting evidence, trigger status, and invalidation conditions.
 - Market context: SPY trend (200-day average), relative strength against SPY and the stock's sector ETF, and the next earnings date, each optional and shown as unverifiable when the account lacks access.
 - SMA200, ATR14, up/down volume, a chandelier trailing stop and Fibonacci retracement levels.
-- A walk-forward backtest (`scripts/backtest.py`) of the same rules, with score-bucket and per-gate ablation reports.
+- A walk-forward backtest (`scripts/backtest.py`) of the same rules, with per-setup, score-bucket and per-gate ablation reports.
 - Multi-method support/resistance zones from confirmed swing clusters, Estimated Volume Profile, daily-bar Anchored VWAP and Fibonacci confluence, with ranked bands, held/failed retrospective tests, and score breakdowns.
 - A holding-status control selecting entry guidance (Buy/Wait) or position-management guidance (Hold/Reduce or Sell) without changing the underlying market assessment.
 - Rule-based Chinese summaries with values and rule identifiers covering completed-day trend, RSI momentum, intraday observations, and signal disagreement.
@@ -63,7 +63,7 @@ The daily view remains usable when the account lacks intraday permission or the 
 
 The daily/swing assessment uses completed daily bars for a **5-20 trading-day** interpretation horizon. It reports Strong Bullish / Bullish / Neutral / Bearish / Strong Bearish separately from entry attractiveness. Intraday Bullish / Neutral / Bearish / Unavailable uses two consecutive completed 5-minute bars versus their own estimated session VWAP and the session open. Unfinished-bar observations are labeled provisional and do not establish confirmed signals.
 
-For a new entry, Buy requires a strict rising `close > SMA20 > SMA50` trend, RSI14 in `[50, 70)`, a close no more than 1.5 ATR above SMA20, a completed-bar SMA20 reclaim or a pullback to SMA20 followed by a close above the prior high, and a weighted score of at least 60. A close below SMA200, SPY below its own SMA200, or an earnings report within 7 days also holds it at Wait. Intraday bars no longer confirm entries; during the session they only block chasing a gap. For a current holding, a bearish daily bias, two closes below SMA50, or a close below the chandelier stop (22-day high − 3 ATR) produces Sell; two closes below SMA20 produce Reduce; otherwise Hold. Intraday disagreement and RSI at/above 70 do not independently create a holding exit. Insufficient required daily history or a missing latest expected completed daily session withholds action guidance.
+For a new entry, Buy requires a strict rising `close > SMA20 > SMA50` trend, RSI14 in `[50, 70)`, a close no more than 1.5 ATR above SMA20, a completed-bar SMA20 reclaim, a pullback to SMA20 followed by a close above the prior high, or a volume breakout above the 60-day high (5-day volume ≥ 1.5× the 20-day average; RSI up to 80 and 3 ATR allowed), at least 2:1 reward/risk from the close to the nearest prior high versus the chandelier stop, and a weighted score of at least 60. A close below SMA200, SPY below its own SMA200, or an earnings report within 7 days also holds it at Wait. Intraday bars no longer confirm entries; during the session they only block chasing a gap. For a current holding, a bearish daily bias, two closes below SMA50, or a close below the chandelier stop (22-day high − 3 ATR) produces Sell; two closes below SMA20 produce Reduce; otherwise Hold. Intraday disagreement and RSI at/above 70 do not independently create a holding exit. Insufficient required daily history or a missing latest expected completed daily session withholds action guidance.
 
 The UI shows the actual indicator values, timestamps, every gate, the score breakdown, conflicts, and conditions for reassessment. See [the exact rule definitions](docs/technical-assessment-rules.md) for thresholds, weights, boundaries, lookbacks, freshness, and precedence. The thresholds and weights are reasoned priors; run the backtest on your own account's data before relying on them. No profitability or prediction-accuracy claim is made.
 
@@ -117,7 +117,7 @@ The endpoints `/stable/historical-price-eod/full` and `/stable/historical-chart/
 
 ## Verification
 
-The watchlist home page update passed **268 offline checks**, including add/refresh/auto-refresh, unreadable-file protection, daily-only batch requests and opening a row on the detail page. The rules, score, market-context and backtest update before it passed **251 offline checks** (`pytest -q`), including no-look-ahead and offline backtest-command checks. It has not yet been run against live FMP data; `scripts/check_live.py` and `scripts/backtest.py` need your local key.
+The reward/risk gate and volume-breakout setup update passed **276 offline checks** (Python 3.10 and 3.13), including the prior-high features, breakout limits, gate pass/fail/unverifiable cases, watchlist columns and the per-setup backtest table. The watchlist home page update before it passed **268 offline checks**, including add/refresh/auto-refresh, unreadable-file protection, daily-only batch requests and opening a row on the detail page. The rules, score, market-context and backtest update before it passed **251 offline checks** (`pytest -q`), including no-look-ahead and offline backtest-command checks. It has not yet been run against live FMP data; `scripts/check_live.py` and `scripts/backtest.py` need your local key.
 
 Earlier record:
 
