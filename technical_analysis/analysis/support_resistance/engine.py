@@ -11,6 +11,9 @@ import math
 import numpy as np
 import pandas as pd
 
+from analysis.indicators import _fibonacci_leg
+from analysis.strategy import FIB_ENTRY_RATIOS, FibLevels, fib_levels
+
 from .avwap import anchored_vwaps
 from .models import (CandidateZone, Interaction, ScoreComponent, SRConfig,
                      SupportResistanceResult, VolumeProfile, Zone)
@@ -19,7 +22,11 @@ from .swings import cluster_pivots, detect_pivots
 from .volume_profile import estimated_volume_profile, profile_candidates
 
 
-_METHOD_ORDER = {"swing": 0, "volume_profile": 1, "anchored_vwap": 2}
+_METHOD_ORDER = {"swing": 0, "volume_profile": 1, "anchored_vwap": 2, "fibonacci": 3}
+# Structure family weights: two independent geometry sources, then two
+# derived confirmations. Fibonacci has the weakest evidence, so it only
+# adds confluence and never creates a zone on its own.
+_STRUCTURE_WEIGHTS = {"swing": 0.35, "volume_profile": 0.35, "anchored_vwap": 0.15, "fibonacci": 0.15}
 _SCORE_LABELS = {"tests": "独立测试", "volume": "估算成交量密度", "structure": "结构方法",
                  "reaction": "历史反应幅度", "recency": "最近测试"}
 
@@ -166,10 +173,20 @@ def _historical_interactions(frame: pd.DataFrame, zone: CandidateZone,
                 reaction = max(float(future["high"].max()) - zone.upper, 0.0) / atr
             elif incoming < zone.lower:
                 reaction = max(zone.lower - float(future["low"].min()), 0.0) / atr
+        # A test held when no close during the event, or on the bar that left
+        # it, landed beyond the far boundary. Unknown incoming side: no verdict.
+        held = None
+        if event_start > 0:
+            incoming = float(frame.iloc[event_start - 1]["close"])
+            closes = frame.iloc[event_start:min(event_end + 2, len(frame))]["close"].astype(float)
+            if incoming > zone.upper:
+                held = bool((closes >= zone.lower).all())
+            elif incoming < zone.lower:
+                held = bool((closes <= zone.upper).all())
         interactions.append(Interaction(
             frame.iloc[event_start]["session"], frame.iloc[event_end]["session"],
             event_start, event_end, reaction,
-            event_end >= len(frame) - config.recent_sessions,
+            event_end >= len(frame) - config.recent_sessions, held,
         ))
     return tuple(interactions)
 
@@ -279,9 +296,18 @@ def _has_hvn(zone: CandidateZone, profile: VolumeProfile, config: SRConfig) -> b
         min(zone.upper, node.upper) > max(zone.lower, node.lower) for node in profile.hvn)
 
 
+def _window_fibonacci(frame: pd.DataFrame, config: SRConfig) -> FibLevels | None:
+    """Retracement levels of the latest high/low leg at the window end."""
+    lookback = min(config.fib_lookback_sessions, len(frame))
+    if lookback < 20:
+        return None
+    leg = _fibonacci_leg(frame["high"].astype(float), frame["low"].astype(float), lookback)
+    return fib_levels(leg.iloc[-1])
+
+
 def _build_zone(zone_id: str, candidate: CandidateZone, frame: pd.DataFrame,
                 profile: VolumeProfile, anchors: tuple, reference: float, atr: float,
-                config: SRConfig) -> Zone:
+                config: SRConfig, fib: FibLevels | None = None) -> Zone:
     methods = list(candidate.methods)
     evidence = list(candidate.evidence)
     evidence.append(f"原始候选标识：{candidate.source_id}。")
@@ -294,17 +320,33 @@ def _build_zone(zone_id: str, candidate: CandidateZone, frame: pd.DataFrame,
                 methods.append("anchored_vwap")
             evidence.append(f"锚点 {anchor.anchor_id}（{anchor.anchor_session}，确认 {anchor.confirmed_session}）"
                             f"日线近似 AVWAP {anchor.latest_value:.4f}；与区间距离 {gap:.4f}（{gap / atr:.3f} ATR）。")
+    if fib is not None:
+        for ratio, level in fib.levels:
+            if ratio not in FIB_ENTRY_RATIOS:
+                continue
+            gap = max(candidate.lower - level, level - candidate.upper, 0.0)
+            if gap <= config.fib_proximity_atr * atr:
+                if "fibonacci" not in methods:
+                    methods.append("fibonacci")
+                evidence.append(f"斐波那契 {ratio:.1%} 回撤位 {level:.2f}（波段 {fib.low:.2f}–{fib.high:.2f}，"
+                                f"{'上涨' if fib.up else '下跌'}波段）与区间距离 {gap:.2f}。")
     tests = _historical_interactions(frame, candidate, config)
     latest = tests[-1] if tests else None
     sessions_since = len(frame) - 1 - latest.end_index if latest is not None else None
     reactions = [item.reaction_atr for item in tests if item.reaction_atr is not None]
     reaction = math.fsum(reactions) / len(reactions) if reactions else None
     fraction, relative = _volume_metrics(candidate, profile)
-    structure = ((0.4 if "swing" in methods and len(candidate.pivot_ids) >= 2 else 0.0) +
-                 (0.4 if _has_hvn(candidate, profile, config) else 0.0) +
-                 (0.2 if "anchored_vwap" in methods else 0.0))
-    weighted_tests = math.fsum(1.5 if item.recent else 1.0 for item in tests)
-    metrics = {"tests": min(weighted_tests / 6, 1.0),
+    structure = ((_STRUCTURE_WEIGHTS["swing"] if "swing" in methods and len(candidate.pivot_ids) >= 2 else 0.0) +
+                 (_STRUCTURE_WEIGHTS["volume_profile"] if _has_hvn(candidate, profile, config) else 0.0) +
+                 (_STRUCTURE_WEIGHTS["anchored_vwap"] if "anchored_vwap" in methods else 0.0) +
+                 (_STRUCTURE_WEIGHTS["fibonacci"] if "fibonacci" in methods else 0.0))
+    # Held tests add strength (recent ones more); a test that closed through
+    # the zone subtracts, since repeated breaks show the level absorbing less.
+    held_count = sum(item.held is True for item in tests)
+    failed_count = sum(item.held is False for item in tests)
+    weighted_tests = math.fsum((1.5 if item.recent else 1.0) * (-0.5 if item.held is False else 1.0)
+                               for item in tests)
+    metrics = {"tests": min(max(weighted_tests / 6, 0.0), 1.0),
                "volume": min(relative / 3, 1.0) if relative is not None else None,
                "structure": structure,
                "reaction": min(reaction / 3, 1.0) if reaction is not None else None,
@@ -325,7 +367,8 @@ def _build_zone(zone_id: str, candidate: CandidateZone, frame: pd.DataFrame,
     score_text = f"评分权重覆盖 {coverage:.0%}"
     if score is None:
         score_text += "，低于 60%，不展示强度分数"
-    explanation = (f"{len(tests)} 次回顾独立互动（近 {config.recent_sessions} 个交易日 {recent_count} 次）；"
+    explanation = (f"{len(tests)} 次回顾独立互动（近 {config.recent_sessions} 个交易日 {recent_count} 次；"
+                   f"守住 {held_count} 次，收盘穿越 {failed_count} 次）；"
                    f"{reaction_text}；{volume_text}。状态：{status_text}；{score_text}。强度分数不是成功概率。")
     availability = frame.iloc[min(max(candidate.available_index, 0), len(frame) - 1)]["session"]
     evidence.append(f"当前静态区间边界形成日：{availability}；突破、回测与恢复仅使用该日起已知区间和已完成日线。"
@@ -334,7 +377,7 @@ def _build_zone(zone_id: str, candidate: CandidateZone, frame: pd.DataFrame,
         evidence.append("估算成交量分布使用整个当前分析窗口；其区间与历史测试的重合属于回顾性证据。"
                         "成交量与 AVWAP 的完整方法汇合仅代表当前快照，不表示历史当时已确认。")
     evidence.append("突破质量未单独评分；反应分量仅使用已观测的后续价格幅度。"
-                    "各方法族仅计一次；AVWAP 派生确认最多贡献结构分量的 20%。")
+                    "各方法族仅计一次；结构分量中摆动 35%、成交量 35%、AVWAP 15%、斐波那契 15%。")
     if breakout is not None:
         evidence.append(f"最近已确认突破日：{breakout}；"
                         + (f"有效回测确认日：{retest}，角色已反转。" if retest else
@@ -347,7 +390,8 @@ def _build_zone(zone_id: str, candidate: CandidateZone, frame: pd.DataFrame,
                 tuple(methods), len(tests), recent_count, latest.end_session if latest else None,
                 reaction, fraction, relative, sessions_since, score, breakdown, status, role,
                 reversed_role, breakout, retest, rank, explanation, tuple(evidence), tests,
-                available_session=availability, recovery_session=recovery)
+                available_session=availability, recovery_session=recovery,
+                held_tests=held_count, failed_tests=failed_count)
 
 
 def _select_ranked_zones(zones: tuple[Zone, ...], reference: float, limit: int
@@ -413,10 +457,12 @@ def analyze_support_resistance(daily: pd.DataFrame, config: SRConfig | None = No
     supported = [candidate for candidate in consolidated if
                  ("swing" in candidate.methods and len(candidate.pivot_ids) >= 2) or
                  _has_hvn(candidate, profile, config)]
-    zones = tuple(_build_zone(f"Z{index:02d}", candidate, frame, profile, anchors, reference, atr, config)
+    fib = _window_fibonacci(frame, config)
+    zones = tuple(_build_zone(f"Z{index:02d}", candidate, frame, profile, anchors, reference, atr, config, fib)
                   for index, candidate in enumerate(supported, start=1))
     supports, resistances, interactions = _select_ranked_zones(zones, reference, config.max_zones_per_side)
     reason = None if supports or resistances or interactions else "有效支撑/阻力证据不足；未强制生成区间。"
     return SupportResistanceResult(config, True, reference, reference_timestamp, reference_provisional,
                                    frame.iloc[-1]["session"], len(frame), atr, supports, resistances,
-                                   interactions, zones, pivots, anchors, profile, tuple(dict.fromkeys(warnings)), reason)
+                                   interactions, zones, pivots, anchors, profile, tuple(dict.fromkeys(warnings)), reason,
+                                   fib)

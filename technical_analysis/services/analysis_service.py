@@ -12,9 +12,10 @@ from weakref import WeakKeyDictionary
 
 import pandas as pd
 
-from analysis.indicators import daily_indicators, session_vwap, visible_daily
+from analysis.indicators import RESISTANCE_LOOKBACKS, daily_indicators, session_vwap, visible_daily
 from analysis.summary import SummaryItem, generate_summaries
-from analysis.signals import TechnicalAssessment, evaluate_signals
+from analysis.signals import MarketContext, TechnicalAssessment, evaluate_signals
+from analysis.strategy import StrategyConfig, attach_benchmarks
 from analysis.support_resistance.engine import analyze_support_resistance
 from analysis.support_resistance.models import SRConfig, SupportResistanceResult
 from data.normalize import normalize_daily, normalize_intraday, session_schedule
@@ -73,6 +74,7 @@ class AnalysisResult:
     support_resistance: SupportResistanceResult | None = None
     timings: AnalysisTimings = field(default_factory=AnalysisTimings)
     sr_variants: dict[SRConfig, SupportResistanceResult] = field(default_factory=dict, repr=False)
+    context: MarketContext = field(default_factory=MarketContext)
     market_versions: tuple[str, str | None] | None = field(default=None, repr=False)
 
 
@@ -115,7 +117,8 @@ def _local_timestamp(value: datetime | None = None) -> pd.Timestamp:
     return stamp.tz_localize("America/New_York") if stamp.tzinfo is None else stamp.tz_convert("America/New_York")
 
 
-def assessment_for(result: AnalysisResult, now: datetime | None = None) -> TechnicalAssessment:
+def assessment_for(result: AnalysisResult, now: datetime | None = None,
+                   config: StrategyConfig | None = None) -> TechnicalAssessment:
     """Evaluate cached completed bars without I/O or any holding-state input.
 
     Rechecking the clock on UI reruns prevents an old entry confirmation from
@@ -127,6 +130,8 @@ def assessment_for(result: AnalysisResult, now: datetime | None = None) -> Techn
         now=_local_timestamp(now).to_pydatetime(),
         daily_retrieved_at=result.daily_retrieved_at,
         intraday_retrieved_at=result.intraday_retrieved_at,
+        context=getattr(result, "context", None),
+        config=config,
     )
 
 
@@ -162,15 +167,38 @@ def _previous_close(daily: pd.DataFrame, session: date) -> tuple[float | None, d
     return float(matched.iloc[-1]["close"]), previous
 
 
-def _calendar_indicators(daily: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+_FEATURES = ("sma20", "sma50", "sma200", "rsi14", "ret63", "ret126", "atr14", "high22", "prev_high",
+             *(f"prior_high{period}" for period in RESISTANCE_LOOKBACKS),
+             "pullback_atr5", "fib_high", "fib_low", "fib_up", "vol_avg20", "rel_volume", "updown_volume20",
+             "vol_ratio5_20")
+
+
+def calendar_indicators(daily: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Use missing-session NaNs only for calculations, never as market bars."""
     schedule = session_schedule(daily["session"].min(), daily["session"].max())
-    prices = daily.set_index("session")["close"].reindex(schedule.index)
-    calculations = daily_indicators(pd.DataFrame({"close": prices}))
+    columns = [column for column in ("close", "high", "low", "volume") if column in daily.columns]
+    bars = daily.drop_duplicates("session", keep="last").set_index("session")[columns].reindex(schedule.index)
+    calculations = daily_indicators(bars)
     result = daily.copy()
-    for column in ("sma20", "sma50", "rsi14"):
-        result[column] = result["session"].map(calculations[column])
-    return result, int(prices.isna().sum())
+    for column in _FEATURES:
+        if column in calculations:
+            result[column] = result["session"].map(calculations[column])
+    return result, int(bars["close"].isna().sum())
+
+
+_calendar_indicators = calendar_indicators
+
+
+def _load_context(client, symbol: str, now) -> tuple[MarketContext, pd.DataFrame | None, pd.DataFrame | None, tuple]:
+    """Benchmarks and events are optional; any failure leaves them unknown."""
+    method = getattr(client, "fetch_context", None)
+    if not callable(method):
+        return MarketContext(notes=("当前数据源未提供大盘、行业或财报信息；相关条件显示为无法核实。",)), None, None, ()
+    try:
+        context = method(symbol, now=now)
+    except Exception:
+        return MarketContext(notes=("大盘、行业或财报信息读取失败；相关条件显示为无法核实。",)), None, None, ()
+    return (context.context, context.market, context.sector, context.versions)
 
 
 def _snapshot(daily: pd.DataFrame, intraday: pd.DataFrame) -> Snapshot:
@@ -210,8 +238,12 @@ def analyze(
     client: MarketDataClient,
     now: datetime | None = None,
     refresh: bool = False,
+    include_intraday: bool = True,
 ) -> AnalysisResult:
     """Daily failures stop analysis; unavailable intraday remains partial success.
+
+    `include_intraday=False` skips the 5-minute request entirely (the
+    watchlist uses this); decisions come from completed daily bars either way.
 
     A cached response is normalized at min(request time, retrieval time).
     Consequently a cached unfinished candle cannot become a confirmed candle
@@ -221,7 +253,9 @@ def analyze(
     symbol = validate_symbol(symbol)
     local_now = _local_timestamp(now)
     daily_future = _DATA_WORKERS.submit(_load_market, client, symbol, "daily", now, refresh)
-    intraday_future = _DATA_WORKERS.submit(_load_market, client, symbol, "intraday", now, refresh)
+    intraday_future = (_DATA_WORKERS.submit(_load_market, client, symbol, "intraday", now, refresh)
+                       if include_intraday else None)
+    context_future = _DATA_WORKERS.submit(_load_context, client, symbol, now)
     daily_data = daily_future.result()
     if daily_data.frame.empty:
         raise DataError("未取得有效的正常交易时段日线数据。请检查股票代码、数据权限或稍后刷新。", "empty_daily")
@@ -231,11 +265,12 @@ def analyze(
     intraday_api_ms = 0.0
     intraday_cache_hit = False
     try:
-        intraday_data = intraday_future.result()
+        intraday_data = intraday_future.result() if intraday_future is not None else None
     except DataError as error:
         intraday_error, error_code = str(error), error.code
         intraday_api_ms = getattr(error, "api_seconds", 0.0) * 1000
         intraday_cache_hit = getattr(error, "cache_hit", False)
+    context, market_frame, sector_frame, context_versions = context_future.result()
     data_wall_ms = (perf_counter() - started) * 1000
     daily_retrieved = _local_timestamp(daily_data.retrieved_at).to_pydatetime()
     intraday_retrieved = None if intraday_data is None else _local_timestamp(intraday_data.retrieved_at).to_pydatetime()
@@ -253,7 +288,8 @@ def analyze(
     key = (symbol, ADJUSTMENT_POLICY, daily_data.latest_session, daily_data.version,
            tuple(daily_data.issues), None if intraday_data is None else intraday_data.latest_session,
            None if intraday_data is None else intraday_data.version,
-           () if intraday_data is None else tuple(intraday_data.issues), error_code)
+           () if intraday_data is None else tuple(intraday_data.issues), error_code, context_versions,
+           context.next_earnings, context.earnings_checked, context.notes, include_intraday)
     cache = _derived_cache(client)
     compute_started = perf_counter()
     with _DERIVED_LOCK:
@@ -272,7 +308,8 @@ def analyze(
         result.timings = replace(timing_base, compute_ms=(perf_counter() - compute_started) * 1000,
                                  total_ms=(perf_counter() - started) * 1000, derived_cache_hit=True)
         return result
-    daily, missing_count = _calendar_indicators(daily_data.frame)
+    daily, missing_count = calendar_indicators(daily_data.frame)
+    daily = attach_benchmarks(daily, market_frame, sector_frame)
     warnings = list(daily_data.issues)
     if missing_count:
         warnings.append(f"日线历史缺少 {missing_count} 个 NYSE 交易日；指标计算在缺口处重新预热，不填补价格。")
@@ -303,6 +340,7 @@ def analyze(
         reference_provisional=snapshot.provisional,
     )
     sr_ms = (perf_counter() - sr_started) * 1000
+    warnings.extend(context.notes)
     result = AnalysisResult(
         symbol=symbol,
         daily=daily,
@@ -319,8 +357,10 @@ def analyze(
             daily, intraday, now=local_now.to_pydatetime(),
             daily_retrieved_at=daily_retrieved,
             intraday_retrieved_at=intraday_retrieved,
+            context=context,
         ),
         support_resistance=sr_result,
+        context=context,
         market_versions=(daily_data.version, None if intraday_data is None else intraday_data.version),
     )
     result.timings = replace(timing_base, compute_ms=(perf_counter() - compute_started) * 1000,
@@ -335,4 +375,4 @@ def analyze(
     return result
 
 
-__all__ = ["AnalysisTimings", "AnalysisResult", "Snapshot", "SummaryItem", "TechnicalAssessment", "SRConfig", "SupportResistanceResult", "analyze", "assessment_for", "support_resistance_for", "visible_daily"]
+__all__ = ["AnalysisTimings", "AnalysisResult", "MarketContext", "calendar_indicators", "Snapshot", "SummaryItem", "TechnicalAssessment", "SRConfig", "SupportResistanceResult", "analyze", "assessment_for", "support_resistance_for", "visible_daily"]

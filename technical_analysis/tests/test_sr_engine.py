@@ -265,7 +265,7 @@ def test_avwap_is_confluence_only_and_correlated_anchor_bonus_is_capped(monkeypa
     result = analyze_support_resistance(frame)
     zone = result.zones[0]
     assert zone.methods.count("anchored_vwap") == 1
-    assert next(item.value for item in zone.score_breakdown if item.name == "structure") == pytest.approx(0.6)
+    assert next(item.value for item in zone.score_breakdown if item.name == "structure") == pytest.approx(0.35 + 0.15)
     assert any("p2" in item and "0.8000" in item for item in zone.evidence)
     mock_analysis(monkeypatch, frame, (), anchors=(anchor("p1", 100.5),))
     assert analyze_support_resistance(frame).zones == ()

@@ -14,21 +14,22 @@ from streamlit.testing.v1 import AppTest
 from analysis.indicators import daily_indicators
 from analysis.summary import SummaryItem
 from config import Settings
-from data import fmp_client, market_store
+from data import fmp_client, market_store, normalize
 from data.fmp_client import validate_symbol
 from data.normalize import session_schedule
 from models import DataError
 from services import analysis_service
 from services.analysis_service import AnalysisResult, Snapshot
 
-APP = Path(__file__).resolve().parents[1] / "app.py"
+APP = Path(__file__).resolve().parents[1] / "views" / "detail.py"
 NEW_YORK = ZoneInfo("America/New_York")
 _APP_TESTS = []
 
 
 @pytest.fixture(autouse=True)
-def isolated_app_configuration(monkeypatch):
-    """Never consume a real local credential or a custom gateway in tests."""
+def isolated_app_configuration(monkeypatch, tmp_path):
+    """Never consume a real local credential, gateway or watchlist in tests."""
+    monkeypatch.setenv("WATCHLIST_FILE", str(tmp_path / "watchlist.json"))
     monkeypatch.setenv("FMP_API_KEY", "offline-test-key")
     monkeypatch.setenv("FMP_BASE_URL", "https://financialmodelingprep.com")
     monkeypatch.setenv("FMP_AUTH_MODE", "query")
@@ -200,18 +201,20 @@ def test_sr_controls_recompute_from_cached_history_without_fetching(monkeypatch)
     _button(app, "分析").click().run(timeout=20)
     _settle(app)
     assert not app.exception
-    assert app.selectbox[0].value == "12 个月 · 252 个交易日"
-    assert app.selectbox[1].value == 3
-    assert all(item.value for item in app.checkbox)
+    assert app.selectbox(key="sr_window").value == "12 个月 · 252 个交易日"
+    assert app.selectbox(key="sr_count").value == 3
+    assert [item.value for item in app.checkbox] == [True, True, True, False]
     charts_with_profile = len(app.get("plotly_chart"))
     app.checkbox[1].set_value(False).run(timeout=20)
     assert not app.exception
     assert len(app.get("plotly_chart")) == charts_with_profile - 1
-    app.selectbox[0].set_value("6 个月 · 126 个交易日").run(timeout=20)
-    app.selectbox[1].set_value(5).run(timeout=20)
+    app.selectbox(key="sr_window").set_value("6 个月 · 126 个交易日").run(timeout=20)
+    app.selectbox(key="sr_count").set_value(5).run(timeout=20)
     app.checkbox[0].set_value(False).run(timeout=20)
     app.checkbox[2].set_value(False).run(timeout=20)
+    app.checkbox[3].set_value(True).run(timeout=20)
     assert not app.exception
+    assert any("综合评分" in metric.label for metric in app.metric)
     assert calls == [("NVDA", False)]
     assert any("最近 126 个交易日" in item.value for item in app.caption)
 
@@ -225,8 +228,8 @@ def test_holding_status_changes_guidance_without_refetching_or_changing_bias(mon
         calls.append((symbol, refresh))
         return result
 
-    def fixed_clock_assessment(data):
-        return original_assessment_for(data, now=datetime(2026, 10, 12, 12, tzinfo=NEW_YORK))
+    def fixed_clock_assessment(data, config=None):
+        return original_assessment_for(data, now=datetime(2026, 10, 12, 12, tzinfo=NEW_YORK), config=config)
 
     monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
     monkeypatch.setattr(analysis_service, "assessment_for", fixed_clock_assessment)
@@ -369,10 +372,12 @@ def test_new_daily_close_refreshes_automatically_and_preserves_controls(monkeypa
     _settle(app)
     app.toggle[0].set_value(True).run(timeout=20)
     app.radio[0].set_value("1Y").run(timeout=20)
-    app.selectbox[0].set_value("6 个月 · 126 个交易日").run(timeout=20)
-    app.selectbox[1].set_value(5).run(timeout=20)
+    app.selectbox(key="sr_window").set_value("6 个月 · 126 个交易日").run(timeout=20)
+    app.selectbox(key="sr_count").set_value(5).run(timeout=20)
     app.checkbox[2].set_value(False).run(timeout=20)
+    app.checkbox[3].set_value(True).run(timeout=20)
     assert not app.exception
+    assert any("综合评分" in metric.label for metric in app.metric)
     assert calls == [("NVDA", False)] and peeks == []
 
     epoch["value"] = next_close
@@ -382,8 +387,8 @@ def test_new_daily_close_refreshes_automatically_and_preserves_controls(monkeypa
     assert app.text_input[0].value == "NVDA"
     assert app.toggle[0].value is True
     assert app.radio[0].value == "1Y"
-    assert app.selectbox[0].value == "6 个月 · 126 个交易日"
-    assert app.selectbox[1].value == 5
+    assert app.selectbox(key="sr_window").value == "6 个月 · 126 个交易日"
+    assert app.selectbox(key="sr_count").value == 5
     assert app.checkbox[2].value is False
     assert peeks and set(peeks) == {"NVDA"}
     if retry_cache_valid:
@@ -504,3 +509,162 @@ def test_daily_close_uses_newer_shared_validated_cache_without_http(monkeypatch)
     assert app.session_state["analysis_result"].confirmed_daily_session == next_close.date()
     app.run(timeout=20)
     assert len(calls) == 2 and http_calls == []
+
+
+def _open_market_clock(monkeypatch):
+    # Only the app's new import is patched; signal/normalization calendars remain real.
+    def open_schedule(start, end):
+        opening = pd.Timestamp(start, tz=NEW_YORK)
+        return pd.DataFrame({"market_open": [opening],
+                             "market_close": [opening + pd.Timedelta(days=1)]}, index=[start])
+    monkeypatch.setattr(normalize, "session_schedule", open_schedule)
+
+
+def test_auto_refresh_fetches_new_data_and_preserves_controls(monkeypatch):
+    template = _daily_only_result()
+    calls = []
+    def offline_analysis(symbol, client, *, refresh=False):
+        calls.append((symbol, refresh))
+        return replace(template, snapshot=replace(template.snapshot, price=100 + len(calls)))
+    monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
+    _open_market_clock(monkeypatch)
+    app = _new_app()
+    assert app.selectbox(key="auto_refresh_seconds").value == 60
+    _button(app, "分析").click().run(timeout=20)
+    _settle(app)
+    app.toggle[0].set_value(True).run(timeout=20)
+    app.radio[0].set_value("1Y").run(timeout=20)
+    app.selectbox(key="sr_window").set_value("6 个月 · 126 个交易日").run(timeout=20)
+    app.selectbox(key="sr_count").set_value(5).run(timeout=20)
+    app.checkbox[2].set_value(False).run(timeout=20)
+    assert calls == [("NVDA", False)]
+
+    app.session_state["refresh_clock"] = perf_counter() - 61
+    app.run(timeout=20)
+    _settle(app)
+    assert not app.exception and not app.error
+    assert calls == [("NVDA", False), ("NVDA", True)]
+    assert app.session_state["analysis_result"].snapshot.price == 102
+    assert app.text_input[0].value == "NVDA"
+    assert app.toggle[0].value is True and app.radio[0].value == "1Y"
+    assert app.selectbox(key="sr_window").value == "6 个月 · 126 个交易日"
+    assert app.selectbox(key="sr_count").value == 5 and app.checkbox[2].value is False
+    app.run(timeout=20)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("mode", ["off", "closed", "interval"])
+def test_auto_refresh_obeys_off_market_hours_and_interval(monkeypatch, mode):
+    template = _daily_only_result()
+    calls = []
+    def offline_analysis(symbol, client, *, refresh=False):
+        calls.append((symbol, refresh))
+        return template
+    monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
+    _open_market_clock(monkeypatch)
+    app = _new_app()
+    _button(app, "分析").click().run(timeout=20)
+    _settle(app)
+    if mode == "off":
+        app.selectbox(key="auto_refresh_seconds").set_value(0).run(timeout=20)
+        # Disabling also suppresses the existing missing-daily-close watcher.
+        app.session_state["analysis_result"] = replace(template, market_versions=("old", None))
+    elif mode == "closed":
+        monkeypatch.setattr(normalize, "session_schedule", lambda start, end: pd.DataFrame())
+    else:
+        app.selectbox(key="auto_refresh_seconds").set_value(300).run(timeout=20)
+    app.session_state["refresh_clock"] = perf_counter() - 61
+    app.run(timeout=20)
+    assert not app.exception
+    assert calls == [("NVDA", False)]
+    # Manual refresh works even when automatic requests are paused/disabled.
+    _button(app, "↻ 刷新数据").click().run(timeout=20)
+    _settle(app)
+    assert calls == [("NVDA", False), ("NVDA", True)]
+
+
+def test_auto_refresh_does_not_overlap_and_backs_off_after_failure(monkeypatch):
+    template = _daily_only_result()
+    calls, started, release = [], Event(), Event()
+    def offline_analysis(symbol, client, *, refresh=False):
+        calls.append((symbol, refresh))
+        if len(calls) == 2:
+            started.set()
+            assert release.wait(15)
+            raise DataError("行情服务暂时不可用。", "network_error")
+        return template
+    monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
+    _open_market_clock(monkeypatch)
+    app = _new_app()
+    try:
+        _button(app, "分析").click().run(timeout=20)
+        _settle(app)
+        app.session_state["refresh_clock"] = perf_counter() - 61
+        app.run(timeout=20)
+        assert started.wait(1)
+        app.session_state["refresh_clock"] = perf_counter() - 61
+        app.run(timeout=20)
+        assert len(calls) == 2
+        release.set()
+        _settle(app)
+        assert app.error and not app.exception
+        assert app.session_state["analysis_result"].snapshot == template.snapshot
+        app.run(timeout=20)
+        assert len(calls) == 2
+        app.session_state["refresh_clock"] = perf_counter() - 61
+        app.run(timeout=20)
+        _settle(app)
+        assert len(calls) == 3 and not app.error
+    finally:
+        release.set()
+
+
+def test_assessment_expires_on_fragment_tick_even_with_fetching_off(monkeypatch):
+    """A daily close that becomes stale withdraws the Buy without any new fetch."""
+    from inspect import getclosurevars
+    from streamlit.testing.v1 import local_script_runner
+
+    template = _daily_only_result()
+    daily = template.daily.copy()
+    for index, close, sma20, sma50 in zip(daily.index[-2:], [100.5, 101], [99.8, 100], [94.8, 95]):
+        daily.loc[index, ["open", "high", "low", "close", "sma20", "sma50", "rsi14"]] = [
+            close, close + 0.5, close - 0.5, close, sma20, sma50, 60]
+    daily.loc[daily.index[-1], ["atr14", "prev_high", "pullback_atr5", "high22", "updown_volume20", "sma200"]] = [
+        2.0, 100.8, 0.2, 102.0, 1.4, 90.0]
+    stamps = pd.DatetimeIndex(["2026-10-12 09:50", "2026-10-12 09:55"], tz=NEW_YORK)
+    intraday = pd.DataFrame({
+        "session": stamps.date, "timestamp": stamps, "bar_end": stamps + pd.Timedelta("5min"),
+        "complete": True, "open": 101, "high": 101.5, "low": 100.5, "close": [101, 101.2],
+        "volume": 1000, "vwap": [100.7, 100.8], "session_open": 100.6,
+        "coverage_complete": True, "vwap_available": True,
+    })
+    clock = {"now": datetime(2026, 10, 12, 10, 2, tzinfo=NEW_YORK)}
+    template = replace(template, daily=daily, intraday=intraday, intraday_error=None,
+                       intraday_session=stamps[0].date(), daily_retrieved_at=clock["now"],
+                       intraday_retrieved_at=clock["now"])
+    calls = []
+    def offline_analysis(symbol, client, *, refresh=False):
+        calls.append(symbol)
+        return template
+    assess = analysis_service.assessment_for
+    monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
+    monkeypatch.setattr(analysis_service, "assessment_for", lambda data, config=None: assess(data, now=clock["now"], config=config))
+    app = _new_app()
+    _button(app, "分析").click().run(timeout=20)
+    _settle(app)
+    app.selectbox(key="auto_refresh_seconds").set_value(0).run(timeout=20)
+    assert next(metric.value for metric in app.metric if metric.label == "操作参考") == "买入"
+
+    # AppTest does not schedule timers. Dispatch only the registered assessment
+    # fragment through its runner, as the browser's periodic event would do.
+    fragment_id = next(key for key, fn in app._fragment_storage._fragments.items()
+                       if getclosurevars(fn).nonlocals["non_optional_func"].__name__ == "render_current_assessment")
+    clock["now"] = datetime(2026, 10, 13, 16, 5, tzinfo=NEW_YORK)
+    rerun_data = local_script_runner.RerunData
+    with monkeypatch.context() as patch:
+        patch.setattr(local_script_runner, "RerunData",
+                      lambda **kwargs: rerun_data(**kwargs, fragment_id=fragment_id))
+        app.run(timeout=20)
+    assert not app.exception
+    assert next(metric.value for metric in app.metric if metric.label == "操作参考") == "数据不足"
+    assert calls == ["NVDA"]

@@ -6,8 +6,8 @@ The two selected stable endpoints use split-adjusted prices; adjClose is unused.
 from collections import OrderedDict
 from concurrent.futures import Future
 from copy import deepcopy
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 import re
 from threading import RLock, local
 import time
@@ -21,6 +21,11 @@ from data.market_store import (ADJUSTMENT_POLICY, MarketDataset, MarketStore,
                                content_version, freshness_epoch)
 from data.normalize import normalize_daily, normalize_intraday
 from models import DataError, RawDataset
+
+import pandas as pd
+
+MARKET_BENCHMARK = "SPY"
+_REFERENCE_TTL_SECONDS = 6 * 3600
 
 NEW_YORK = ZoneInfo("America/New_York")
 _SYMBOL = re.compile(r"[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z0-9]{1,2})?\Z")
@@ -70,6 +75,27 @@ def _check_source_symbol(source: object, requested: str) -> None:
         raise DataError("FMP 返回的行情代码与请求不一致，已停止该数据分析。", "symbol_mismatch")
 
 
+@dataclass
+class ContextBundle:
+    """Optional benchmark bars and event dates; each part may be missing."""
+    context: object
+    market: pd.DataFrame | None = None
+    sector: pd.DataFrame | None = None
+    versions: tuple = ()
+
+
+def _next_earnings(rows: list, today: date) -> date | None:
+    upcoming = []
+    for row in rows:
+        try:
+            value = date.fromisoformat(str(row.get("date", ""))[:10])
+        except (AttributeError, ValueError):
+            continue
+        if value >= today:
+            upcoming.append(value)
+    return min(upcoming) if upcoming else None
+
+
 class FMPClient:
     """Keep credentials in the adapter, never in cache keys or result metadata."""
 
@@ -93,6 +119,7 @@ class FMPClient:
         self._generations: dict[tuple[str, str], int] = {}
         self._errors: OrderedDict[tuple, tuple[float, str, str]] = OrderedDict()
         self._market_store = MarketStore()
+        self._reference: OrderedDict[tuple[str, str], tuple[float, list]] = OrderedDict()
 
     def _http_session(self):
         if self._injected_session:
@@ -128,6 +155,87 @@ class FMPClient:
         symbol, local_now = validate_symbol(symbol), _local_now(now)
         return self._market_store.get(symbol, timeframe, ADJUSTMENT_POLICY,
                                       freshness_epoch(timeframe, local_now), local_now)
+
+    def _reference_rows(self, endpoint: str, symbol: str) -> list:
+        """Fetch a small JSON list (profile, earnings) with sanitized failures."""
+        if not self._settings.api_key:
+            raise DataError("尚未配置 FMP_API_KEY，请设置环境变量或本地 .env 文件。", "missing_key")
+        key = (endpoint, symbol)
+        with self._lock:
+            cached = self._reference.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                return deepcopy(cached[1])
+        params, headers = {"symbol": symbol}, {}
+        if self._settings.auth_mode == "proxy":
+            headers["X-Proxy-Key"] = self._settings.api_key
+        else:
+            params["apikey"] = self._settings.api_key
+        try:
+            response = self._http_session().get(
+                self._settings.base_url.rstrip("/") + "/stable/" + endpoint,
+                params=params, headers=headers, timeout=self._settings.request_timeout_seconds,
+                allow_redirects=False, verify=self._settings.ca_bundle or True)
+        except Exception:
+            raise DataError("FMP 网络请求失败，请稍后重试。", "network_error") from None
+        if response.status_code in {401, 402, 403}:
+            raise DataError("当前 FMP 账户无权访问此数据。", "permission_denied")
+        if not 200 <= response.status_code < 300:
+            raise DataError("FMP 请求失败，暂时无法获取此数据。", "request_failed")
+        try:
+            payload = response.json()
+        except Exception:
+            raise DataError("FMP 返回的数据格式无效。", "malformed_response") from None
+        error = _provider_error(payload)
+        if error:
+            raise error from None
+        if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+            raise DataError("FMP 返回的数据格式无效。", "malformed_response")
+        rows = [{name: row.get(name) for name in ("symbol", "date", "sector")} for row in payload]
+        with self._lock:
+            self._reference[key] = (time.monotonic() + _REFERENCE_TTL_SECONDS, rows)
+            while len(self._reference) > _MAX_CACHE_ENTRIES:
+                self._reference.popitem(last=False)
+        return deepcopy(rows)
+
+    def fetch_context(self, symbol: str, now: datetime | None = None) -> ContextBundle:
+        """SPY and sector-ETF daily bars, sector name and next earnings date.
+
+        Every part is optional. A missing permission or failed request leaves
+        that part unknown with a note; it never fails the stock's analysis.
+        """
+        from analysis.signals import MarketContext
+        from analysis.strategy import SECTOR_ETFS
+        symbol, local_now = validate_symbol(symbol), _local_now(now)
+        notes, versions = [], []
+        market = sector_frame = None
+        sector = etf = None
+        next_earnings, earnings_checked = None, False
+        try:
+            dataset = self.fetch_validated_daily(MARKET_BENCHMARK, now=now)
+            market = dataset.frame
+            versions.append((MARKET_BENCHMARK, dataset.version))
+        except DataError:
+            notes.append("SPY 日线读取失败；大盘环境与相对强度无法核实。")
+        try:
+            profile = self._reference_rows("profile", symbol)
+            sector = next((row.get("sector") for row in profile if row.get("sector")), None)
+            etf = SECTOR_ETFS.get(sector)
+        except DataError:
+            notes.append("公司资料读取失败；行业相对强度不可用。")
+        if etf and etf != symbol:
+            try:
+                dataset = self.fetch_validated_daily(etf, now=now)
+                sector_frame = dataset.frame
+                versions.append((etf, dataset.version))
+            except DataError:
+                notes.append(f"行业 ETF {etf} 日线读取失败；行业相对强度不可用。")
+        try:
+            next_earnings = _next_earnings(self._reference_rows("earnings", symbol), local_now.date())
+            earnings_checked = True
+        except DataError:
+            notes.append("财报日期读取失败；财报事件风险无法核实。")
+        context = MarketContext(next_earnings, earnings_checked, sector, etf, tuple(notes))
+        return ContextBundle(context, market, sector_frame, tuple(versions))
 
     def _invalidate(self, endpoint: str, symbol: str) -> None:
         timeframe = "daily" if endpoint == "historical-price-eod/full" else "5min"

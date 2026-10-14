@@ -44,6 +44,8 @@ class SRConfig:
     hvn_density_multiple: float = 1.5
     lvn_density_multiple: float = 0.5
     avwap_proximity_atr: float = 0.5
+    fib_lookback_sessions: int = 126
+    fib_proximity_atr: float = 0.25
     max_anchors: int = 2
     max_zones_per_side: int = 3
     weights: ScoreWeights = field(default_factory=ScoreWeights)
@@ -162,6 +164,7 @@ class Interaction:
     end_index: int
     reaction_atr: float | None
     recent: bool
+    held: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +206,8 @@ class Zone:
     interactions: tuple[Interaction, ...] = ()
     available_session: date | None = None
     recovery_session: date | None = None
+    held_tests: int = 0
+    failed_tests: int = 0
 
 
 @dataclass(frozen=True)
@@ -224,3 +229,4 @@ class SupportResistanceResult:
     profile: VolumeProfile = field(default_factory=lambda: VolumeProfile(False))
     warnings: tuple[str, ...] = ()
     reason: str | None = None
+    fibonacci: object | None = None
