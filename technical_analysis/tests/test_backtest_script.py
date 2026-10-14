@@ -57,6 +57,6 @@ def test_backtest_command_runs_offline_and_writes_csv(monkeypatch, tmp_path, cap
     output = capsys.readouterr().out
     assert "Per-symbol results" in output and "Ablation" in output and "offline-test-key" not in output
     assert "Trades by entry setup" in output
-    assert "no reward/risk gate" in output and "no breakout setup" in output
+    assert "with reward/risk >= 2 gate" in output and "no breakout setup" in output
     for name in ("symbols.csv", "score_buckets.csv", "setups.csv", "trades.csv", "ablation.csv"):
         assert (tmp_path / "artifacts" / "backtest" / name).is_file()

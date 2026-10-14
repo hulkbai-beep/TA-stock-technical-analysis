@@ -153,7 +153,7 @@ else:
             "综合评分": st.column_config.ProgressColumn("综合评分", min_value=0, max_value=100, format="%.0f",
                                                     help="七项指标加权评分；新开仓需至少 60 分。"),
             "入场形态": st.column_config.TextColumn(help="今日已完成日线出现的入场触发：回踩、站回 SMA20 或放量突破 60 日前高。"),
-            "盈亏比": st.column_config.TextColumn(help="上方最近前高的空间 ÷ 到吊灯止损的距离；新开仓需至少 2。"),
+            "盈亏比": st.column_config.TextColumn(help="上方最近前高的空间 ÷ 到吊灯止损的距离。仅作参考并计入综合评分，不是买入条件。"),
             "最新价": st.column_config.NumberColumn(format="%.2f"),
             "涨跌幅 %": st.column_config.NumberColumn(format="%+.2f"),
             "距吊灯止损 %": st.column_config.NumberColumn(format="%.1f", help="收盘价高于吊灯止损（22 日最高价 − 3 ATR）的百分比。"),

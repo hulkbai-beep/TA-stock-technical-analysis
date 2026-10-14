@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from analysis.signals import MarketContext, evaluate_signals
+from analysis.strategy import StrategyConfig
 
 
 NY = ZoneInfo("America/New_York")
@@ -368,18 +369,20 @@ def test_low_score_blocks_entry():
     result = _assess(daily)
 
     assert result.score.score < 60
-    assert {gate.name: gate.status for gate in result.decision.gates}["reward_risk"] == "pass"
     assert result.entry.code == "wait"
 
 
-def test_entry_too_close_to_a_prior_high_waits_for_room():
+def test_entry_too_close_to_a_prior_high_waits_only_when_the_gate_is_on():
     daily = _daily()
     daily["prior_high126"] = [104.0, 104.0]
 
-    result = _assess(daily)
-
-    assert result.entry.code == "wait"
-    assert any("盈亏比" in item for item in result.entry.conditions)
+    default = _assess(daily)
+    assert default.entry.code == "buy" and "盈亏比" not in default.entry.explanation
+    gated = evaluate_signals(daily, _intraday(), now=NOW, daily_retrieved_at=NOW, intraday_retrieved_at=NOW,
+                             context=MarketContext(earnings_checked=True),
+                             config=StrategyConfig(use_reward_risk_gate=True))
+    assert gated.entry.code == "wait"
+    assert any("盈亏比" in item for item in gated.entry.conditions)
 
 
 def test_score_weights_sum_and_breakdown_are_reported():

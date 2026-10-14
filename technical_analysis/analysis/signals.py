@@ -291,7 +291,8 @@ def _actions(daily: BiasAssessment, intraday: BiasAssessment, facts: dict | None
     )
     if not blockers:
         attractiveness = "入场条件已满足"
-        entry = ActionGuidance("buy", "买入", "已完成日线的趋势、动量、位置、触发、盈亏比、大盘和综合评分均满足规则，可在当前或下一交易时段考虑入场。",
+        checked = "趋势、动量、位置、触发、" + ("盈亏比、" if config.use_reward_risk_gate else "") + "大盘和综合评分"
+        entry = ActionGuidance("buy", "买入", f"已完成日线的{checked}均满足规则，可在当前或下一交易时段考虑入场。",
                                TIMEFRAME, "已触发", tuple(conditions), entry_invalidation, tuple(conflicts))
     else:
         failed = {gate.name for gate in decision.gates if gate.status == "fail"}

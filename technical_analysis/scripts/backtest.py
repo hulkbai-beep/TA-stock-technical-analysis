@@ -41,8 +41,8 @@ ABLATIONS = {
     "no SPY gate": {"use_market_gate": False},
     "no SMA200 gate": {"use_long_trend_gate": False},
     "no earnings gate": {"use_earnings_gate": False},
-    "no reward/risk gate": {"use_reward_risk_gate": False},
-    "reward/risk >= 1": {"min_reward_risk": 1.0},
+    "with reward/risk >= 2 gate": {"use_reward_risk_gate": True},
+    "with reward/risk >= 1 gate": {"use_reward_risk_gate": True, "min_reward_risk": 1.0},
     "no breakout setup": {"use_breakout_setup": False},
     "no chandelier stop": {"use_chandelier_exit": False},
 }

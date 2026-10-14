@@ -64,7 +64,9 @@ class StrategyConfig:
     breakout_max_extension_atr: float = 3.0
     min_reward_risk: float = 2.0
     use_breakout_setup: bool = True
-    use_reward_risk_gate: bool = True
+    # Off by default: on 15 large caps over 6 years the 2:1 gate blocked two thirds of
+    # entries whose average result matched the ones it kept. The ratio is still scored.
+    use_reward_risk_gate: bool = False
     use_long_trend_gate: bool = True
     use_market_gate: bool = True
     use_earnings_gate: bool = True

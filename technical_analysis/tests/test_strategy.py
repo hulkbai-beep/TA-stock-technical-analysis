@@ -134,10 +134,13 @@ def _gate(decision, name):
     return next(gate for gate in decision.gates if gate.name == name)
 
 
+GATED = StrategyConfig(use_reward_risk_gate=True)
+
+
 def test_reward_risk_gate_blocks_entries_too_close_to_a_prior_high():
     # Stop 102 - 3*2 = 96, risk 5; the 20-day high at 102 leaves only 1 of upside.
     prior, latest = _setup_rows()
-    decision = evaluate_bar(prior, latest)
+    decision = evaluate_bar(prior, latest, GATED)
     assert decision.trigger == "pullback"
     gate = _gate(decision, "reward_risk")
     assert gate.status == "fail" and gate.required and "0.20" in gate.detail
@@ -145,14 +148,19 @@ def test_reward_risk_gate_blocks_entries_too_close_to_a_prior_high():
     assert not decision.buy
     # Above the 20/60-day highs the next one is the 126-day high at 112: 11 / 5 = 2.2.
     prior, latest = _setup_rows(prior_high20=100.9, prior_high60=100.9, prior_high126=112.0)
-    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "pass"
+    assert _gate(evaluate_bar(prior, latest, GATED), "reward_risk").status == "pass"
     prior, latest = _setup_rows(prior_high20=100.9, prior_high60=100.9, prior_high126=np.nan, prior_high252=np.nan)
-    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "pass"
+    assert _gate(evaluate_bar(prior, latest, GATED), "reward_risk").status == "pass"
     prior, latest = _setup_rows(atr14=np.nan)
-    assert _gate(evaluate_bar(prior, latest), "reward_risk").status == "unknown"
+    assert _gate(evaluate_bar(prior, latest, GATED), "reward_risk").status == "unknown"
+
+
+def test_reward_risk_is_scored_but_not_required_by_default():
     prior, latest = _setup_rows()
-    assert "reward_risk" not in {gate.name for gate in
-                                 evaluate_bar(prior, latest, StrategyConfig(use_reward_risk_gate=False)).gates}
+    decision = evaluate_bar(prior, latest)
+    assert "reward_risk" not in {gate.name for gate in decision.gates}
+    assert decision.reward_risk.ratio == pytest.approx(0.2)
+    assert next(item for item in decision.score.components if item.name == "reward_risk").value == 0.0
 
 
 def test_volume_breakout_gets_its_own_trigger_and_wider_limits():
@@ -160,7 +168,7 @@ def test_volume_breakout_gets_its_own_trigger_and_wider_limits():
     hot = dict(sma20=96.0, rsi14=76.0, prior_high20=100.0, prior_high60=100.0, prior_high126=113.0,
                vol_ratio5_20=1.8)
     prior, latest = _setup_rows(**hot)
-    decision = evaluate_bar(prior, latest)
+    decision = evaluate_bar(prior, latest, GATED)
     assert decision.trigger == "breakout"
     assert {name: _gate(decision, name).status for name in ("rsi_range", "extension", "trigger", "reward_risk")} == \
         {"rsi_range": "pass", "extension": "pass", "trigger": "pass", "reward_risk": "pass"}
