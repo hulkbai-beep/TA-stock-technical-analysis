@@ -3,17 +3,18 @@
 Each ticker runs the same `analyze` service as the detail page, with daily
 bars only: every action rule uses completed daily bars, so the 5-minute
 request would add cost without changing a decision. Rows keep both the
-new-entry and the holding guidance, so toggling "held" needs no new request.
+new-entry and the holding guidance, with and without the optional reward/risk
+gate, so toggling "held" or the gate needs no new request.
 """
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 import logging
 from typing import Callable
 
-from analysis.strategy import SETUP_SHORT, Gate
+from analysis.strategy import SETUP_SHORT, Gate, StrategyConfig
 from models import DataError
 from services import analysis_service
 
@@ -51,10 +52,14 @@ class WatchlistRow:
     relative_strength: float | None = None
     setup: str | None = None
     reward_risk: str | None = None
+    # Entry guidance with the optional 2:1 reward/risk gate switched on.
+    gated_entry: tuple[str, str, str] | None = None
 
-    def action(self, holding: bool) -> tuple[str, str, str]:
+    def action(self, holding: bool, reward_risk_gate: bool = False) -> tuple[str, str, str]:
         if holding:
             return self.position_code, self.position_label, self.position_reason
+        if reward_risk_gate and self.gated_entry is not None:
+            return self.gated_entry
         return self.entry_code, self.entry_label, self.entry_reason
 
 
@@ -96,6 +101,13 @@ def summarize_result(result, analyzed_at: datetime) -> WatchlistRow:
         position_reason = "；".join(decision.exit_reasons) or "退出条件未触发"
     if entry.code == "insufficient_data":
         entry_reason = position_reason = entry.explanation
+    gated_entry = None
+    if decision is not None and entry.code != "insufficient_data":
+        # Same bars and clock, gate on, so the page can switch without a new fetch.
+        gated = analysis_service.assessment_for(result, now=assessment.evaluated_at,
+                                                config=replace(StrategyConfig(), use_reward_risk_gate=True))
+        if gated.decision is not None:
+            gated_entry = (gated.entry.code, gated.entry.label, _entry_reason(gated.decision.gates, gated.entry.code))
     return WatchlistRow(
         symbol=result.symbol, analyzed_at=analyzed_at, price=price,
         change_percent=result.snapshot.change_percent, session=result.snapshot.session,
@@ -108,7 +120,7 @@ def summarize_result(result, analyzed_at: datetime) -> WatchlistRow:
         chandelier=chandelier,
         stop_distance=None if chandelier is None or not price else (price - chandelier) / price,
         next_earnings=result.context.next_earnings, relative_strength=relative,
-        setup=setup, reward_risk=reward_risk,
+        setup=setup, reward_risk=reward_risk, gated_entry=gated_entry,
     )
 
 

@@ -13,6 +13,7 @@ from models import DataError
 from services import watchlist_service
 from services.watchlist_service import ACTION_ORDER
 from ui.client import require_client
+from ui.preferences import reward_risk_toggle
 
 NEW_YORK = ZoneInfo("America/New_York")
 INTERVALS = {0: "关闭", 300: "每 5 分钟", 900: "每 15 分钟", 1800: "每 30 分钟", 3600: "每 60 分钟"}
@@ -56,14 +57,14 @@ def _market_open(now: datetime) -> bool:
     return not schedule.empty and schedule.iloc[0].market_open <= now < schedule.iloc[0].market_close
 
 
-def _table(items, rows) -> pd.DataFrame:
+def _table(items, rows, reward_risk_gate: bool = False) -> pd.DataFrame:
     records = []
     for item in items:
         row = rows.get(item.symbol)
         if row is None:
             records.append({"代码": item.symbol, "持有": item.holding, "操作参考": "… 待分析", "_order": 9})
             continue
-        code, _, reason = row.action(item.holding)
+        code, _, reason = row.action(item.holding, reward_risk_gate)
         records.append({
             "代码": item.symbol,
             "持有": item.holding,
@@ -114,6 +115,7 @@ with st.container(border=True):
     auto_column.selectbox("自动刷新", list(INTERVALS), index=2, key="watchlist_auto_refresh",
                           format_func=INTERVALS.get,
                           help="页面打开时，在美股常规交易时段定时刷新整个自选股；收盘后自动补取当日收盘数据。")
+    gate = reward_risk_toggle(st, "reward_risk_gate_home")
 
 if added and new_symbol.strip():
     try:
@@ -137,13 +139,13 @@ if st.session_state.get("watchlist_error"):
 if not items:
     st.info("自选股为空。在上方输入股票代码并点击「添加股票」。")
 else:
-    actions = [rows[item.symbol].action(item.holding)[0] for item in items if item.symbol in rows]
+    actions = [rows[item.symbol].action(item.holding, gate)[0] for item in items if item.symbol in rows]
     counts = st.columns(5)
     for column, (label, codes) in zip(counts, (("买入", {"buy"}), ("等待", {"wait"}), ("持有观察", {"hold"}),
                                               ("减仓 / 卖出", {"reduce", "reduce_sell"}),
                                               ("数据不足 / 失败", {"insufficient_data", "error"}))):
         column.metric(label, sum(code in codes for code in actions))
-    table = _table(items, rows)
+    table = _table(items, rows, gate)
     shown = table.drop(columns=[column for column in ("_order", "_score") if column in table])
     event = st.dataframe(
         shown, key="watchlist_table", on_select="rerun", selection_mode="single-row",
@@ -153,7 +155,7 @@ else:
             "综合评分": st.column_config.ProgressColumn("综合评分", min_value=0, max_value=100, format="%.0f",
                                                     help="七项指标加权评分；新开仓需至少 60 分。"),
             "入场形态": st.column_config.TextColumn(help="今日已完成日线出现的入场触发：回踩、站回 SMA20 或放量突破 60 日前高。"),
-            "盈亏比": st.column_config.TextColumn(help="上方最近前高的空间 ÷ 到吊灯止损的距离。仅作参考并计入综合评分，不是买入条件。"),
+            "盈亏比": st.column_config.TextColumn(help="上方最近前高的空间 ÷ 到吊灯止损的距离。计入综合评分；打开上方「买入需盈亏比 ≥ 2」后也是买入条件。"),
             "最新价": st.column_config.NumberColumn(format="%.2f"),
             "涨跌幅 %": st.column_config.NumberColumn(format="%+.2f"),
             "距吊灯止损 %": st.column_config.NumberColumn(format="%.1f", help="收盘价高于吊灯止损（22 日最高价 − 3 ATR）的百分比。"),

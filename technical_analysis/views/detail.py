@@ -17,6 +17,7 @@ from ui.assessment import render_assessment
 from ui.support_resistance import render_support_resistance
 from ui.charts import daily_chart, intraday_chart, rsi_chart
 from ui.client import get_client
+from ui.preferences import reward_risk_toggle, strategy_config
 from data.watchlist import add_symbol, load_watchlist, save_watchlist, set_holding
 
 
@@ -123,7 +124,8 @@ def render_current_assessment() -> None:
     # Freshness expires even with auto-fetch off or while a request is failing.
     current = st.session_state.get("analysis_result")
     if current is not None:
-        render_assessment(assessment_for(current), st.session_state.get("holding_status", False))
+        render_assessment(assessment_for(current, config=strategy_config()),
+                          st.session_state.get("holding_status", False))
 
 
 @st.fragment(run_every=30)
@@ -218,12 +220,13 @@ open_requested = opened is not None and (result is None or result.symbol != open
 if (submitted or changed or open_requested) and result and ticker.strip().upper() != result.symbol:
     st.session_state.pop("analysis_result", None)
     result = None
-control_left, holding_column, control_right = st.columns([3, 2, 1], vertical_alignment="center")
+control_left, holding_column, gate_column, control_right = st.columns([3, 2, 2, 1], vertical_alignment="center")
 range_label = control_left.radio("日线显示范围", ["3M", "6M", "1Y"], index=1, horizontal=True,
                                  help="只改变显示范围；相同日期的指标数值保持一致。")
 holding = holding_column.toggle("目前持有这只股票？", value=False, key="holding_status", on_change=sync_holding,
                                 help="仅切换新建仓或持仓管理的操作参考，不改变行情和技术强弱判断；不读取账户或成本。"
                                      "若该股票在自选股中，持有状态会同步保存。")
+reward_risk_toggle(gate_column, "reward_risk_gate_detail")
 refresh = control_right.button("↻ 刷新数据", disabled=result is None, use_container_width=True)
 st.selectbox("自动刷新", [0, 30, 60, 300], index=2, key="auto_refresh_seconds",
              format_func=lambda seconds: {0: "关闭", 30: "每 30 秒", 60: "每 60 秒", 300: "每 5 分钟"}[seconds],

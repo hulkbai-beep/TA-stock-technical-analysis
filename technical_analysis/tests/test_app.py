@@ -228,8 +228,8 @@ def test_holding_status_changes_guidance_without_refetching_or_changing_bias(mon
         calls.append((symbol, refresh))
         return result
 
-    def fixed_clock_assessment(data):
-        return original_assessment_for(data, now=datetime(2026, 10, 12, 12, tzinfo=NEW_YORK))
+    def fixed_clock_assessment(data, config=None):
+        return original_assessment_for(data, now=datetime(2026, 10, 12, 12, tzinfo=NEW_YORK), config=config)
 
     monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
     monkeypatch.setattr(analysis_service, "assessment_for", fixed_clock_assessment)
@@ -648,7 +648,7 @@ def test_assessment_expires_on_fragment_tick_even_with_fetching_off(monkeypatch)
         return template
     assess = analysis_service.assessment_for
     monkeypatch.setattr(analysis_service, "analyze", offline_analysis)
-    monkeypatch.setattr(analysis_service, "assessment_for", lambda data: assess(data, now=clock["now"]))
+    monkeypatch.setattr(analysis_service, "assessment_for", lambda data, config=None: assess(data, now=clock["now"], config=config))
     app = _new_app()
     _button(app, "分析").click().run(timeout=20)
     _settle(app)

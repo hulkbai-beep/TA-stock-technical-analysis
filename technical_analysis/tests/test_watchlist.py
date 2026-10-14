@@ -13,6 +13,7 @@ from analysis.strategy import RewardRisk
 from config import Settings
 from data import normalize
 from data.fmp_client import FMPClient
+from data.preferences import Preferences, load_preferences, preferences_path, save_preferences
 from data.watchlist import (DEFAULT_SYMBOLS, MAX_SYMBOLS, WatchItem, add_symbol, load_watchlist,
                             remove_symbols, save_watchlist, set_holding)
 from models import DataError
@@ -24,6 +25,7 @@ from test_app import _daily_only_result
 NY = ZoneInfo("America/New_York")
 ROUTER = Path(__file__).resolve().parents[1] / "app.py"
 NOW = datetime(2026, 10, 12, 17, tzinfo=NY)
+MIDDAY = datetime(2026, 10, 12, 12, tzinfo=NY)
 _APPS = []
 
 
@@ -93,6 +95,39 @@ def test_unreadable_file_is_reported_and_never_overwritten(isolated):
 def _offline_client(symbols):
     session = _OfflineSession(symbols)
     return FMPClient(Settings(api_key="offline"), session=session), session
+
+
+def test_preferences_default_off_round_trip_and_ignore_a_broken_file(isolated):
+    path = preferences_path()
+    assert path == isolated.with_name("preferences.json")
+    assert load_preferences() == Preferences(reward_risk_gate=False)
+    save_preferences(Preferences(reward_risk_gate=True))
+    assert json.loads(path.read_text(encoding="utf-8")) == {"reward_risk_gate": True}
+    assert load_preferences().reward_risk_gate is True
+    path.write_text("{not json", encoding="utf-8")
+    assert load_preferences().reward_risk_gate is False
+
+
+def _buy_result(symbol="NVDA"):
+    """A Buy whose nearest prior high (102) leaves only 0.2:1 reward/risk."""
+    template = _daily_only_result()
+    daily = template.daily.copy()
+    for index, close, sma20, sma50 in zip(daily.index[-2:], [100.5, 101], [99.8, 100], [94.8, 95]):
+        daily.loc[index, ["open", "high", "low", "close", "sma20", "sma50", "rsi14"]] = [
+            close, close + 0.5, close - 0.5, close, sma20, sma50, 60]
+    daily.loc[daily.index[-1], ["atr14", "prev_high", "pullback_atr5", "high22", "updown_volume20", "sma200",
+                                "prior_high20", "prior_high60", "prior_high126", "prior_high252"]] = [
+        2.0, 100.8, 0.2, 102.0, 1.4, 90.0, 102.0, 102.0, 102.0, 102.0]
+    result = replace(template, symbol=symbol, daily=daily)
+    result.assessment = analysis_service.assessment_for(result, now=MIDDAY)
+    return result
+
+
+def test_row_keeps_entry_guidance_with_the_reward_risk_gate_on():
+    row = summarize_result(_buy_result(), MIDDAY)
+    assert row.action(False) == ("buy", "买入", "全部入场条件满足")
+    assert row.action(False, reward_risk_gate=True) == ("wait", "等待", "盈亏比不足")
+    assert row.action(True, reward_risk_gate=True) == row.action(True)
 
 
 def test_batch_analysis_uses_daily_bars_only_and_isolates_failures():
@@ -185,6 +220,44 @@ def test_home_loads_every_ticker_once_and_shows_a_sorted_table(monkeypatch):
     assert {"操作参考", "综合评分", "入场形态", "盈亏比", "主要原因", "距吊灯止损 %", "下次财报"} <= set(table.columns)
     app.run(timeout=30)
     assert len(calls) == len(DEFAULT_SYMBOLS), "a rerun must reuse the session's rows"
+
+
+def test_reward_risk_switch_updates_both_pages_without_refetching_and_is_saved(monkeypatch, isolated):
+    calls = []
+
+    def analyze(symbol, client, *, now=None, refresh=False, include_intraday=True):
+        calls.append(symbol)
+        return _buy_result(symbol)
+
+    original = analysis_service.assessment_for
+    monkeypatch.setattr(analysis_service, "analyze", analyze)
+    monkeypatch.setattr(analysis_service, "assessment_for",
+                        lambda data, now=None, config=None: original(data, now=MIDDAY, config=config))
+    app = _home()
+    assert app.toggle(key="reward_risk_gate_home").value is False
+    assert set(app.dataframe[0].value["操作参考"]) == {"🟢 买入"}
+    calls.clear()
+    app.toggle(key="reward_risk_gate_home").set_value(True).run(timeout=30)
+    assert not app.exception and not calls
+    table = app.dataframe[0].value
+    assert set(table["操作参考"]) == {"⚪ 等待"} and set(table["主要原因"]) == {"盈亏比不足"}
+    assert json.loads(preferences_path().read_text(encoding="utf-8")) == {"reward_risk_gate": True}
+
+    app.session_state["open_ticker"] = ("NVDA", False)
+    app.switch_page("views/detail.py").run(timeout=30)
+    for _ in range(50):
+        if "analysis_result" in app.session_state:
+            break
+        app.run(timeout=30)
+    app.run(timeout=30)
+    assert app.toggle(key="reward_risk_gate_detail").value is True
+    assert {metric.label: metric.value for metric in app.metric}["操作参考"] == "等待"
+    app.toggle(key="reward_risk_gate_detail").set_value(False).run(timeout=30)
+    assert {metric.label: metric.value for metric in app.metric}["操作参考"] == "买入"
+    assert load_preferences().reward_risk_gate is False
+
+    save_preferences(Preferences(reward_risk_gate=True))
+    assert _home().toggle(key="reward_risk_gate_home").value is True, "a new session starts from the saved choice"
 
 
 def test_add_ticker_saves_and_analyzes_only_the_new_symbol(monkeypatch, isolated):

@@ -117,7 +117,7 @@ First check daily data adequacy and freshness for both holding states. If the co
 | RSI entry range | required | `50 <= R < 70` |
 | No chasing | required | `0 <= (C - M20)/ATR14 <= 1.5` (falls back to 0-3% when ATR is unavailable) |
 | Daily trigger | required | **Volume breakout**: `C` above the highest high of the previous 60 sessions, with 5-session average volume ≥ 1.5 × the 20-session average; or **SMA20 reclaim**: `P <= P20` and `C > M20`; or **pullback resumption**: `P > P20`, `C > M20`, the lowest low of the last 5 sessions came within 0.5 ATR of SMA20 (or below it), and `C` closed above the previous session's high |
-| Reward/risk | optional, off by default | (nearest prior high above `C` − `C`) ÷ (`C` − chandelier stop) ≥ 2 (`min_reward_risk`). When switched on (`use_reward_risk_gate=True`) it is required. Prior highs are the highest highs of the previous 20, 60, 126 and 252 sessions. Passes when `C` is above all of them; fails when `C` is at or below the stop; unverifiable without ATR, the 22-session high or any prior high |
+| Reward/risk | optional, off by default | (nearest prior high above `C` − `C`) ÷ (`C` − chandelier stop) ≥ 2 (`min_reward_risk`). When switched on (the **买入需盈亏比 ≥ 2** switch on either page, saved in `preferences.json`; `use_reward_risk_gate=True` in code) it is required. Prior highs are the highest highs of the previous 20, 60, 126 and 252 sessions. Passes when `C` is above all of them; fails when `C` is at or below the stop; unverifiable without ATR, the 22-session high or any prior high |
 | Score | required | weighted score available and at least 60 |
 | Long-term trend | conditional | `C > SMA200` |
 | Market regime | conditional | SPY close > SPY SMA200 |

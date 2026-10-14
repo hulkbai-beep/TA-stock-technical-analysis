@@ -57,11 +57,14 @@ def load_watchlist(path: Path | None = None) -> tuple[list[WatchItem], str | Non
 
 
 def save_watchlist(items: list[WatchItem], path: Path | None = None) -> None:
-    """Write atomically so an interrupted save cannot leave a half-written file."""
-    path = path or watchlist_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": _VERSION, "tickers": [{"symbol": item.symbol, "holding": item.holding} for item in items]}
-    descriptor, temporary = tempfile.mkstemp(prefix=".watchlist-", suffix=".json", dir=path.parent)
+    write_json_atomic(path or watchlist_path(), payload)
+
+
+def write_json_atomic(path: Path, payload) -> None:
+    """Write atomically so an interrupted save cannot leave a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".json", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -91,4 +94,4 @@ def set_holding(items: list[WatchItem], symbol: str, holding: bool) -> list[Watc
 
 
 __all__ = ["DEFAULT_SYMBOLS", "MAX_SYMBOLS", "WatchItem", "add_symbol", "load_watchlist", "remove_symbols",
-           "save_watchlist", "set_holding", "watchlist_path"]
+           "save_watchlist", "set_holding", "watchlist_path", "write_json_atomic"]

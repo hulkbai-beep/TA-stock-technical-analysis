@@ -15,7 +15,7 @@ import pandas as pd
 from analysis.indicators import RESISTANCE_LOOKBACKS, daily_indicators, session_vwap, visible_daily
 from analysis.summary import SummaryItem, generate_summaries
 from analysis.signals import MarketContext, TechnicalAssessment, evaluate_signals
-from analysis.strategy import attach_benchmarks
+from analysis.strategy import StrategyConfig, attach_benchmarks
 from analysis.support_resistance.engine import analyze_support_resistance
 from analysis.support_resistance.models import SRConfig, SupportResistanceResult
 from data.normalize import normalize_daily, normalize_intraday, session_schedule
@@ -117,7 +117,8 @@ def _local_timestamp(value: datetime | None = None) -> pd.Timestamp:
     return stamp.tz_localize("America/New_York") if stamp.tzinfo is None else stamp.tz_convert("America/New_York")
 
 
-def assessment_for(result: AnalysisResult, now: datetime | None = None) -> TechnicalAssessment:
+def assessment_for(result: AnalysisResult, now: datetime | None = None,
+                   config: StrategyConfig | None = None) -> TechnicalAssessment:
     """Evaluate cached completed bars without I/O or any holding-state input.
 
     Rechecking the clock on UI reruns prevents an old entry confirmation from
@@ -130,6 +131,7 @@ def assessment_for(result: AnalysisResult, now: datetime | None = None) -> Techn
         daily_retrieved_at=result.daily_retrieved_at,
         intraday_retrieved_at=result.intraday_retrieved_at,
         context=getattr(result, "context", None),
+        config=config,
     )
 
 
