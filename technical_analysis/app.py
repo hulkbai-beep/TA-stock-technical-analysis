@@ -10,6 +10,7 @@ import streamlit as st
 from config import load_settings
 from data.fmp_client import FMPClient
 from data.market_store import freshness_epoch
+from data.normalize import session_schedule
 from models import DataError
 from services.analysis_service import SRConfig, analyze, assessment_for, support_resistance_for, visible_daily
 from services.ticker_requests import LatestTickerRequest
@@ -59,6 +60,10 @@ def ticker_changed() -> None:
     st.session_state["ticker_changed"] = True
 
 
+def reset_refresh_clock() -> None:
+    st.session_state["refresh_clock"] = perf_counter()
+
+
 def publish_request() -> bool:
     """Only the main Streamlit thread publishes the currently selected generation."""
     controller = st.session_state["ticker_requests"]
@@ -73,6 +78,8 @@ def publish_request() -> bool:
     if state.symbol is not None and not controller.is_current(state.request_id, state.symbol):
         return False
     st.session_state["published_request"] = state.request_id
+    # Start the next interval after success or failure, including slow requests.
+    reset_refresh_clock()
     if state.status == "ready":
         st.session_state["analysis_result"] = state.result
         st.session_state.pop("analysis_error", None)
@@ -91,6 +98,7 @@ def poll_loading() -> None:
 
 
 def start_request(symbol: str, refresh: bool = False) -> None:
+    reset_refresh_clock()
     st.session_state.pop("analysis_error", None)
     try:
         settings = load_settings()
@@ -105,12 +113,56 @@ def start_request(symbol: str, refresh: bool = False) -> None:
     st.session_state["ticker_requests"].submit(symbol, loader, refresh=refresh)
 
 
+@st.fragment(run_every=5)
+def watch_auto_refresh() -> None:
+    current = st.session_state.get("analysis_result")
+    interval = st.session_state.get("auto_refresh_seconds", 60)
+    controller = st.session_state["ticker_requests"]
+    if not interval:
+        st.caption("自动刷新已关闭。可点击「刷新数据」手动更新。")
+        return
+    if current is None:
+        st.caption("分析股票后，将在常规交易时段自动刷新。")
+        return
+    if (controller.current_symbol != current.symbol or
+            st.session_state.get("ticker_input", "").strip().upper() != current.symbol):
+        return
+    if controller.poll().status == "loading":
+        st.caption("◌ 正在刷新行情；完成后重新计时。")
+        return
+    now = datetime.now(ZoneInfo("America/New_York"))
+    schedule = session_schedule(now.date(), now.date())
+    market_open = (not schedule.empty and
+                   schedule.iloc[0].market_open <= now < schedule.iloc[0].market_close)
+    if not market_open:
+        st.caption("休市期间暂停定时刷新，常规交易时段自动恢复；收盘数据仍会检查更新。")
+        return
+    elapsed = perf_counter() - st.session_state.setdefault("refresh_clock", perf_counter())
+    if elapsed >= interval:
+        # A timed refresh must fetch new data even within the five-minute cache TTL.
+        start_request(current.symbol, refresh=True)
+        st.rerun()
+    remaining = max(1, int(interval - elapsed + 0.999))
+    st.caption(f"自动刷新已开启 · 每 {interval} 秒 · 距下次刷新约 {remaining} 秒。")
+
+
+@st.fragment(run_every=30)
+def render_current_assessment() -> None:
+    # Freshness expires even with auto-fetch off or while a request is failing.
+    current = st.session_state.get("analysis_result")
+    if current is not None:
+        render_assessment(assessment_for(current), st.session_state.get("holding_status", False))
+
+
 @st.fragment(run_every=30)
 def watch_daily_close() -> None:
     """A cheap clock/cache check; only a new missing daily close starts I/O."""
     current = st.session_state.get("analysis_result")
     controller = st.session_state["ticker_requests"]
-    if current is None or current.market_versions is None or controller.poll().status == "loading":
+    if (not st.session_state.get("auto_refresh_seconds", 60) or current is None or
+            current.market_versions is None or controller.poll().status == "loading" or
+            controller.current_symbol != current.symbol or
+            st.session_state.get("ticker_input", "").strip().upper() != current.symbol):
         return
     now = datetime.now(ZoneInfo("America/New_York"))
     epoch = freshness_epoch("daily", now)
@@ -173,6 +225,10 @@ range_label = control_left.radio("日线显示范围", ["3M", "6M", "1Y"], index
 holding = holding_column.toggle("目前持有这只股票？", value=False, key="holding_status",
                                 help="仅切换新建仓或持仓管理的操作参考，不改变行情和技术强弱判断；不读取账户或成本。")
 refresh = control_right.button("↻ 刷新数据", disabled=result is None, use_container_width=True)
+st.selectbox("自动刷新", [0, 30, 60, 300], index=2, key="auto_refresh_seconds",
+             format_func=lambda seconds: {0: "关闭", 30: "每 30 秒", 60: "每 60 秒", 300: "每 5 分钟"}[seconds],
+             on_change=reset_refresh_clock,
+             help="页面保持打开时，在美股常规交易时段获取最新行情。5 分钟K线仍按原周期形成；数据延迟取决于提供方。")
 
 if submitted or changed or refresh:
     requested_symbol = result.symbol if refresh and result else ticker
@@ -181,6 +237,7 @@ publish_request()
 result = st.session_state.get("analysis_result")
 if st.session_state["ticker_requests"].poll().status == "loading":
     poll_loading()
+watch_auto_refresh()
 
 if st.session_state.get("analysis_error"):
     st.error(st.session_state["analysis_error"])
@@ -223,7 +280,7 @@ if snapshot.session != datetime.now(ZoneInfo("America/New_York")).date():
 for warning in result.warnings:
     st.warning(warning)
 
-render_assessment(assessment_for(result), holding)
+render_current_assessment()
 
 with st.expander("支撑/阻力设置", expanded=True):
     window_column, count_column = st.columns(2)
