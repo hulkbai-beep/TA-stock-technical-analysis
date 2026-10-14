@@ -37,8 +37,11 @@ The default host is the official FMP API and uses its query-parameter authentica
 - Latest available bar price, percentage change when a valid previous-session comparison exists, actual trading date, market-data time, and separate retrieval times.
 - Daily candlesticks and volume with SMA20 and SMA50; a separate RSI14 panel; 3M, 6M, and 1Y display ranges.
 - The most recent available regular-hours session of 5-minute candlesticks, volume, and estimated session VWAP.
-- A prominent technical assessment with separate daily strength, RSI momentum, intraday bias, conditional action guidance, supporting/conflicting evidence, trigger status, and invalidation conditions.
-- Multi-method support/resistance zones from confirmed swing clusters, Estimated Volume Profile, and daily-bar Anchored VWAP, with ranked bands, retrospective interactions, and score breakdowns.
+- A prominent technical assessment with separate daily strength, RSI momentum, intraday bias, a weighted 0-100 technical score with its breakdown, conditional action guidance, every entry gate, supporting/conflicting evidence, trigger status, and invalidation conditions.
+- Market context: SPY trend (200-day average), relative strength against SPY and the stock's sector ETF, and the next earnings date, each optional and shown as unverifiable when the account lacks access.
+- SMA200, ATR14, up/down volume, a chandelier trailing stop and Fibonacci retracement levels.
+- A walk-forward backtest (`scripts/backtest.py`) of the same rules, with score-bucket and per-gate ablation reports.
+- Multi-method support/resistance zones from confirmed swing clusters, Estimated Volume Profile, daily-bar Anchored VWAP and Fibonacci confluence, with ranked bands, held/failed retrospective tests, and score breakdowns.
 - A holding-status control selecting entry guidance (Buy/Wait) or position-management guidance (Hold/Reduce or Sell) without changing the underlying market assessment.
 - Rule-based Chinese summaries with values and rule identifiers covering completed-day trend, RSI momentum, intraday observations, and signal disagreement.
 - Validation, partial-data warnings, validated OHLCV and analysis caches, automatic ticker switching, and manual refresh.
@@ -49,9 +52,9 @@ The daily view remains usable when the account lacks intraday permission or the 
 
 The daily/swing assessment uses completed daily bars for a **5-20 trading-day** interpretation horizon. It reports Strong Bullish / Bullish / Neutral / Bearish / Strong Bearish separately from entry attractiveness. Intraday Bullish / Neutral / Bearish / Unavailable uses two consecutive completed 5-minute bars versus their own estimated session VWAP and the session open. Unfinished-bar observations are labeled provisional and do not establish confirmed signals.
 
-For a new entry, Buy requires a strict rising `close > SMA20 > SMA50` trend, RSI14 in `[50, 70)`, no more than 3% daily SMA20 extension, a verified completed-bar SMA20 reclaim or rising continuation, and fresh Bullish confirmation during the current regular session. Otherwise the result is Wait. For a current holding, Bearish/Strong Bearish daily bias or two consecutive completed closes below their own SMA50 produces Reduce or Sell; otherwise the daily assessment is Hold. Intraday disagreement and RSI at/above 70 do not independently create a holding exit. Insufficient required daily history or a missing latest expected completed daily session withholds action guidance.
+For a new entry, Buy requires a strict rising `close > SMA20 > SMA50` trend, RSI14 in `[50, 70)`, a close no more than 1.5 ATR above SMA20, a completed-bar SMA20 reclaim or a pullback to SMA20 followed by a close above the prior high, and a weighted score of at least 60. A close below SMA200, SPY below its own SMA200, or an earnings report within 7 days also holds it at Wait. Intraday bars no longer confirm entries; during the session they only block chasing a gap. For a current holding, a bearish daily bias, two closes below SMA50, or a close below the chandelier stop (22-day high − 3 ATR) produces Sell; two closes below SMA20 produce Reduce; otherwise Hold. Intraday disagreement and RSI at/above 70 do not independently create a holding exit. Insufficient required daily history or a missing latest expected completed daily session withholds action guidance.
 
-The UI shows the actual indicator values, timestamps, occurred/pending triggers, conflicts, and conditions for reassessment. See [the exact rule definitions](docs/technical-assessment-rules.md) for thresholds, boundaries, lookbacks, freshness, and precedence. These initial heuristics have not been historically validated or backtested; no profitability or prediction-accuracy claim is made.
+The UI shows the actual indicator values, timestamps, every gate, the score breakdown, conflicts, and conditions for reassessment. See [the exact rule definitions](docs/technical-assessment-rules.md) for thresholds, weights, boundaries, lookbacks, freshness, and precedence. The thresholds and weights are reasoned priors; run the backtest on your own account's data before relying on them. No profitability or prediction-accuracy claim is made.
 
 ## Support and resistance
 
@@ -99,9 +102,13 @@ Validated OHLCV caches are bounded and scoped to one provider client, keyed by t
 
 Independent daily and intraday retrieval run concurrently. The support/resistance loops are optimized without changing detection or scoring rules. See [performance behavior and measurements](docs/performance.md) for API, validation, computation and server UI timing boundaries, reproducible benchmarks and limitations. The 500 ms cached and 3 s uncached goals are targets, not guarantees.
 
-The endpoints `/stable/historical-price-eod/full` and `/stable/historical-chart/5min` are requested separately with explicit date ranges. Intraday retrieval covers 35 calendar days and requests `extended=false`, with local regular-session filtering as a second check. Actual responses and account permissions determine availability. A missing key stops API requests. Authentication, entitlement, rate-limit, network, malformed-response, and empty-data failures appear as sanitized messages. If daily data fails, the analysis cannot proceed; if only intraday fails, daily charts and summaries remain available with an explicit intraday-unavailable notice.
+The endpoints `/stable/historical-price-eod/full` and `/stable/historical-chart/5min` are requested separately with explicit date ranges. Market context adds daily bars for SPY and the sector ETF (cached like any ticker) plus `/stable/profile` and `/stable/earnings`, cached for six hours; a failure in any of these leaves only the dependent conditions unverifiable. Intraday retrieval covers 35 calendar days and requests `extended=false`, with local regular-session filtering as a second check. Actual responses and account permissions determine availability. A missing key stops API requests. Authentication, entitlement, rate-limit, network, malformed-response, and empty-data failures appear as sanitized messages. If daily data fails, the analysis cannot proceed; if only intraday fails, daily charts and summaries remain available with an explicit intraday-unavailable notice.
 
 ## Verification
+
+The rules, score, market-context and backtest update passed **251 offline checks** (`pytest -q`), including no-look-ahead and offline backtest-command checks. It has not yet been run against live FMP data; `scripts/check_live.py` and `scripts/backtest.py` need your local key.
+
+Earlier record:
 
 The performance and ticker-switching update passed **222 offline checks**, covering cached reuse, concurrent loads, revisions, session rollover, rapid-switch stale success/error suppression and automatic daily-close refresh, alongside the existing indicator, assessment and support/resistance checks. The real NVDA check on October 12, 2026 used 252 completed daily sessions and returned 3 support zones, 1 resistance zone, an estimated volume profile and 2 confirmed AVWAP anchors. Live NVDA/AAPL API and cached-switch timings are documented separately. These checks verify application behavior, not trading performance.
 
@@ -110,6 +117,7 @@ From the `technical_analysis` directory:
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python scripts\check_live.py
+.\.venv\Scripts\python scripts\backtest.py --ablation
 ```
 
 The focused offline checks use clearly separated synthetic fixtures to verify indicator arithmetic, Wilder initialization, VWAP session resets, data validation, session boundaries, unfinished-bar behavior, and deterministic assessment rules. Assessment cases include bullish, bearish, conflicting, overbought-in-an-uptrend, insufficient/stale data, and holding-status guidance. Fixtures are test inputs only; the production UI has no demo-data fallback. These correctness checks are not a backtest.
@@ -130,7 +138,9 @@ The real-ticker check on **2026-10-12** succeeded through the locally configured
 | `data/market_store.py` | Bounded validated OHLCV snapshots, content versions and exchange-calendar freshness |
 | `data/normalize.py` | Validation, timestamps, calendar sessions, and bar completion |
 | `analysis/indicators.py` | SMA, Wilder RSI, and session VWAP calculations |
-| `analysis/signals.py` | Structured market assessment and conditional entry/holding rules |
+| `analysis/strategy.py` | Shared bar-level rules: daily bias, entry gates, exits, weighted score, Fibonacci levels |
+| `analysis/signals.py` | Structured market assessment, freshness, intraday context and Chinese explanations |
+| `analysis/backtest.py` | Walk-forward simulation and summary statistics over `evaluate_bar` |
 | `analysis/support_resistance/` | Daily preparation, filtered swings, estimated volume profile, AVWAP, consolidation, validity and scoring |
 | `ui/support_resistance.py` | Zone evidence, profile statistics and score presentation |
 | `analysis/summary.py` | Supplementary Chinese indicator observations and evidence |
@@ -141,6 +151,7 @@ The real-ticker check on **2026-10-12** succeeded through the locally configured
 | `scripts/check_live.py` | Explicit real-ticker integration check |
 | `scripts/benchmark_performance.py` | Separate API/validation/computation timings and cached-switch benchmark |
 | `scripts/benchmark_ui.py` | Offline full-dashboard server UI generation benchmark |
+| `scripts/backtest.py` | Historical test of the entry/exit rules, score buckets and gate ablation |
 | `tests/` | Focused offline correctness checks |
 
-Add future calculations to `analysis/indicators.py` and assessment rules to `analysis/signals.py`, document them, and expose structured output through the service before adding a UI panel. Keep trading-rule logic out of the UI. A future historical-validation module can consume normalized bars without changing retrieval or chart code; historical validation is outside this update.
+Add future calculations to `analysis/indicators.py` and assessment rules to `analysis/strategy.py`, document them, and expose structured output through the service before adding a UI panel. Keep trading-rule logic out of the UI. `analysis/backtest.py` consumes the same featured bars and rules, so a rule change is automatically what the backtest measures.

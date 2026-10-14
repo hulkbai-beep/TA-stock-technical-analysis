@@ -1,21 +1,43 @@
 # Technical assessment rules
 
-These are initial, deterministic heuristics for interpreting the existing indicators. They have not been historically validated, backtested, or calibrated for profitability, prediction accuracy, or a success probability. The assessment describes one stock over a defined timeframe and uses no account, position size, purchase price, portfolio, or suitability information.
+These are deterministic heuristics for interpreting the indicators. The thresholds and score weights are reasoned priors, not fitted parameters, and they have not yet been validated on real history: run `scripts/backtest.py` (see [Backtesting](#backtesting)) before relying on them. The assessment describes one stock over a defined timeframe and uses no account, position size, purchase price, portfolio, or suitability information.
 
-`analysis/signals.py` owns the rules and structured results. The analysis service supplies calculated, normalized bars; the UI renders the results and selects the guidance for the holding-status control. Changing that control changes the action guidance, not the daily bias, momentum, intraday bias, or supporting market values.
+`analysis/strategy.py` owns the bar-level rules (daily bias, entry gates, exits and the weighted score) through `evaluate_bar`, which both the dashboard and the backtest call, so a historical test runs exactly the rules the dashboard shows. `analysis/signals.py` adds session freshness, intraday context and the Chinese explanations. The analysis service supplies calculated, normalized bars; the UI renders the results and selects the guidance for the holding-status control. Changing that control changes the action guidance, not the daily bias, momentum, intraday bias, score, or supporting market values.
 
 ## Timeframes, data, and reference values
 
-- Daily bias and position management use completed daily bars, for an intended **5-20 trading-day** daily/swing timeframe. This is an interpretation horizon, not a promised holding period or prediction.
-- Entry timing uses completed **5-minute regular-session** bars. Intraday evidence is evaluated separately and cannot change the daily bias or, by itself, cause a holding to be sold.
+- Daily bias, entries and position management use completed daily bars, for an intended **5-20 trading-day** daily/swing timeframe. This is an interpretation horizon, not a promised holding period or prediction.
+- Completed **5-minute regular-session** bars are context only. They cannot change the daily bias, create a Buy, or cause a holding to be sold. During an active session they can only hold back a Buy when price has already run beyond the extension limit (no chasing a gap).
 - Sessions follow the NYSE calendar in `America/New_York`, including holidays, early closes, and daylight-saving time. The latest expected completed daily session is the latest scheduled session whose close has elapsed at assessment time. Before today's scheduled close, it is the previous scheduled session.
 - A confirmed daily assessment needs the latest two completed bars to be consecutive scheduled trading sessions, with finite positive closes/SMA20/SMA50 and finite RSI14 on both. Thus SMA50 and its one-session slope require at least **51 consecutive valid session closes**. Daily indicator calculations insert missing-session NaNs for calculation only, so a history gap restarts warm-up rather than bridging missing prices. RSI14 must lie in `[0, 100]`.
-- SMA20/SMA50 are arithmetic means of 20/50 session closes. RSI14 uses the existing Wilder calculation: 14 close-to-close changes initialize arithmetic average gain/loss, then each average is updated as `(previous * 13 + current) / 14`. Loss-only, gain-only, and flat states return 0, 100, and 50 respectively.
+- SMA20/SMA50/SMA200 are arithmetic means of 20/50/200 session closes. RSI14 uses the Wilder calculation: 14 close-to-close changes initialize arithmetic average gain/loss, then each average is updated as `(previous * 13 + current) / 14`. Loss-only, gain-only, and flat states return 0, 100, and 50 respectively.
 - Estimated session VWAP is `sum(((high + low + close) / 3) * volume) / sum(volume)`, reset at 09:30 New York. Opening coverage, every elapsed completed 5-minute interval, and positive cumulative volume are required. It is an estimate from bars, not trade-by-trade VWAP.
 - Unfinished daily and 5-minute bars may be shown as **provisional** observations. They never satisfy a confirmed rule or trigger. Cached bars retain completion status from the earlier of retrieval time and analysis time; merely waiting does not confirm a cached unfinished bar.
 - Prices, SMA values, RSI values, session open, VWAP, session dates, and bar end times are the actual calculated inputs. Daily timestamps derive from the scheduled session close; intraday times are interval boundaries, not last-trade timestamps. Retrieval times remain separate from market-data times.
 
-Chart-range selection does not alter the full-history calculations. These action rules do not use the separate support/resistance engine or infer targets, stop-loss levels, or calibrated probabilities. An SMA or VWAP reference is a changing calculated level, not an execution order or guaranteed fill price.
+Chart-range selection does not alter the full-history calculations. An SMA, VWAP or chandelier reference is a changing calculated level, not an execution order or guaranteed fill price.
+
+### Additional daily features
+
+All are calculated over the calendar-reindexed history, so a missing session restarts warm-up instead of bridging the gap (`analysis/indicators.py`).
+
+| Feature | Definition | Used for |
+| --- | --- | --- |
+| SMA200 | 200-session arithmetic mean of closes | long-term trend gate, trend score |
+| ATR14 | Wilder ATR: first 14 true ranges averaged, then `(prev*13 + TR)/14` | extension limit, location score, chandelier stop |
+| 22-session high | highest high of the last 22 sessions | chandelier stop |
+| Pullback depth | lowest `(low - SMA20)/ATR14` of the last 5 sessions | pullback trigger |
+| Up/down volume ratio | 20-session volume on up closes ÷ volume on down closes, capped at 5 | volume score |
+| Relative volume | volume ÷ average of the previous 20 sessions | displayed in the data table |
+| 63/126-session return | `close / close[n sessions ago] - 1` | relative strength |
+| Fibonacci leg | highest high and lowest low of the last 126 sessions, and which came last | Fibonacci levels |
+| SPY close, SMA50, SMA200, returns | from completed SPY bars, matched by session | market gate, regime and relative-strength scores |
+| Sector ETF returns | from the stock's SPDR sector ETF (FMP profile sector) | relative-strength score |
+| Next earnings date | first FMP earnings date on or after today | earnings gate |
+
+SPY, the sector ETF, the company profile and the earnings calendar are fetched separately (`FMPClient.fetch_context`). Any of them can be unavailable for an account; the stock's own analysis still runs and the dependent conditions are shown as unverifiable.
+
+Fibonacci retracements (23.6/38.2/50/61.8/78.6%) are measured on the 126-session leg: down from the high when the high is the more recent extreme, otherwise up from the low. Published evidence for Fibonacci levels is weak, so they are used only as confluence: a small bonus in the location score and an extra method on support/resistance zones. They never create a signal or a zone by themselves.
 
 ## Daily trend and strength
 
@@ -46,9 +68,9 @@ The strict uptrend/downtrend tests require both moving-average slopes to agree. 
 
 An overbought strict uptrend can remain **Strong Bullish**, while new-entry guidance is **Wait**. RSI at or below 30 never creates a Buy by itself. RSI at or above 70 never creates a holding exit by itself.
 
-Context: [Fidelity's RSI guide](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/RSI) explains that RSI can stay overbought or oversold during strong trends. That general indicator behavior does not validate this application's particular thresholds, combinations, action rules, or precedence; those are the initial heuristics defined here.
+Context: [Fidelity's RSI guide](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/RSI) explains that RSI can stay overbought or oversold during strong trends. That general indicator behavior does not validate this application's particular thresholds, combinations, action rules, or precedence.
 
-## Intraday bias and confirmation
+## Intraday bias
 
 Use the latest actual intraday session, with its date displayed explicitly. Its two latest completed 5-minute bars must be consecutive intervals in that session. Each must have finite positive close/VWAP, complete session coverage, and valid session-open data.
 
@@ -59,7 +81,25 @@ Use the latest actual intraday session, with its date displayed explicitly. Its 
 | Bearish | Both completed closes are below their own cumulative session VWAP, and the latest close is below the session open. |
 | Neutral | Required evidence exists, but neither directional condition is met. |
 
-A historical session may still have a dated intraday bias. It cannot confirm an entry for the current session. Entry confirmation additionally requires an **active current regular-hours NYSE session**, matching intraday date, and a latest completed intraday bar ending no more than **10 minutes** before assessment time. Before open, after close, on holidays/weekends, with stale intraday bars, or with a prior-session intraday result, the entry trigger remains pending. At an intraday boundary, only fully elapsed intervals can qualify.
+Earlier versions required a fresh Bullish intraday reading, no more than 10 minutes old, for every Buy. That tied a multi-day decision to minute-level noise and made the signal impossible to act on outside a short window, so it was removed. A Bearish intraday reading against a bullish daily setup is now reported as a timing conflict. During an active session with fresh intraday bars (latest completed bar no more than 10 minutes old), a latest completed 5-minute close more than 1.5 ATR above the daily SMA20 holds the entry at Wait.
+
+## Weighted technical score
+
+`technical_score` combines seven components, each normalized to `[0, 1]`, into a 0-100 score. Weights are configurable in `StrategyConfig.weights`:
+
+| Component | Weight | Normalization |
+| --- | --- | --- |
+| Trend structure | 25% | share of `close>SMA20`, `SMA20>SMA50`, `close>SMA200`, rising SMA20, rising SMA50 that hold (needs 3 known) |
+| Relative strength | 20% | average 63/126-session excess return vs SPY and the sector ETF; `0.5 + excess/0.20`, clipped (+10% → 1, -10% → 0) |
+| Market regime | 15% | 0.6 if SPY > its SMA200, plus 0.4 if SPY SMA50 > SMA200 |
+| RSI momentum | 10% | 1.0 for RSI 55-65, linear to 0 at 40 and 80 |
+| Pullback location | 10% | 1.0 within 0-0.75 ATR above SMA20, linear to 0 at 2 ATR above or 0.5 ATR below; +0.25 within 0.5 ATR of a 38.2/50/61.8% retracement of an up leg |
+| Volume confirmation | 10% | up/down volume ratio: 0 at 0.8, 1 at 1.5 |
+| Reward/risk room | 10% | distance to the nearest resistance (4 ATR if none) ÷ distance to the nearest support (min 0.5 ATR) or the chandelier stop; 1:1 → 0, 3:1 → 1 |
+
+Why these weights: trend and relative strength carry the most published evidence at multi-week horizons (time-series and cross-sectional momentum), so together they get 45%. Market regime is a strong filter but changes slowly, so it acts mostly as a gate and is 15% of the score. RSI, location and volume refine timing and get 10% each. Reward/risk room uses the support/resistance engine. MACD and Stochastics are deliberately absent: they largely restate RSI and moving-average information and would double-count it.
+
+Missing components are excluded and the remaining weights are renormalized; at least 50% of the configured weight must be calculable or the score is unavailable. Grades: ≥75 strong, ≥60 favorable, ≥40 neutral, otherwise weak. The score is a ranking aid, not a probability. The backtest's score-bucket table shows whether higher scores have actually preceded better returns; adjust the weights if they have not.
 
 ## Action precedence
 
@@ -67,40 +107,61 @@ First check daily data adequacy and freshness for both holding states. If the co
 
 ### No current holding: Buy or Wait
 
-**Buy** requires every condition below; otherwise the result is **Wait**, with the failed/pending conditions stated:
+**Buy** requires every required gate to pass and no conditional gate to fail; otherwise the result is **Wait**. Each gate is listed in the panel as passed (✓), failed (✗) or unverifiable (？):
 
-1. Daily inputs are sufficient and the latest completed daily session is the latest expected completed session.
-2. A strict uptrend exists: `C > M20 > M50`, `d20 > 0`, and `d50 > 0`.
-3. Momentum is in the entry range: `50 <= R < 70`. This intentionally differs from the strength threshold of 55.
-4. Daily SMA20 extension is within range: `0 <= (C / M20 - 1) * 100 <= 3`.
-5. One of two daily triggers has occurred on consecutive completed bars:
-   - **SMA20 reclaim:** `P <= P20` and `C > M20`.
-   - **Rising continuation:** `P > P20`, `C > M20`, and `C > P`.
-6. The current NYSE regular session is active, its intraday bias is Bullish, the intraday session is today's scheduled session, and the latest completed 5-minute bar is no more than 10 minutes old.
-7. That latest completed intraday close is above the confirmed daily SMA20 and no more than 3% above it: `0 < (intraday_close / M20 - 1) * 100 <= 3`.
+| Gate | Type | Condition |
+| --- | --- | --- |
+| Strict uptrend | required | `C > M20 > M50`, `d20 > 0`, `d50 > 0` |
+| RSI entry range | required | `50 <= R < 70` |
+| No chasing | required | `0 <= (C - M20)/ATR14 <= 1.5` (falls back to 0-3% when ATR is unavailable) |
+| Daily trigger | required | **SMA20 reclaim**: `P <= P20` and `C > M20`; or **pullback resumption**: `P > P20`, `C > M20`, the lowest low of the last 5 sessions came within 0.5 ATR of SMA20 (or below it), and `C` closed above the previous session's high |
+| Score | required | weighted score available and at least 60 |
+| Long-term trend | conditional | `C > SMA200` |
+| Market regime | conditional | SPY close > SPY SMA200 |
+| Earnings | conditional | no earnings report within the next 7 calendar days |
 
-The daily trigger and intraday confirmation are shown independently as occurred or pending. A daily uptrend with bearish, neutral, unavailable, stale, or prior-session intraday evidence therefore remains Wait for a new entry. A strong uptrend with excessive SMA20 extension or RSI14 at/above 70 also remains Wait; strength and entry attractiveness are separate outputs.
+Conditional gates block only when their data shows a failure. Missing data is shown as unverifiable rather than silently passed.
 
-### Current holding: Hold or Reduce/Sell
+The old "rising continuation" trigger (any up close above SMA20 in an uptrend) fired on most days of a trend, so it was not really a trigger. Pullback resumption requires an actual test of the average followed by a close above the prior high. The old fixed 3% extension limit treated a utility and a semiconductor stock alike; the ATR limit scales with each stock's volatility.
+
+A daily uptrend with bearish or unavailable intraday evidence can still be a Buy. A strong uptrend with excessive extension or RSI14 at/above 70 remains Wait; strength and entry attractiveness are separate outputs.
+
+### Current holding: Hold, Reduce or Sell
 
 After the same daily adequacy/freshness gate, evaluate:
 
-1. **Reduce or Sell** if the daily bias is Bearish or Strong Bearish, **or** the two consecutive completed daily closes are both below their own SMA50: `P < P50` and `C < M50`.
-2. Otherwise **Hold**. This is a completed-day position-management assessment, including a Neutral daily bias when no defined exit condition has occurred. It does not imply that adding to the holding has an attractive entry.
+1. **Sell** (code `reduce_sell`) if any of:
+   - the daily bias is Bearish or Strong Bearish;
+   - two consecutive completed closes are below their own SMA50 (`P < P50` and `C < M50`);
+   - the close is below the **chandelier stop**: 22-session highest high − 3 × ATR14.
+2. **Reduce** (code `reduce`) if no Sell condition holds but two consecutive completed closes are below their own SMA20 (`P < P20` and `C < M20`): a partial trim when short-term momentum fades inside an intact medium-term trend.
+3. Otherwise **Hold**.
 
-For holding management, RSI14 at/above 70, an unfinished daily decline, and bearish intraday evidence do not independently override the daily Hold. Conflicting intraday evidence remains visible as a risk/entry-timing condition. A new-entry Wait and a holding Hold can therefore coexist for the same market assessment.
+The old rules sold only on a bearish bias or two closes below SMA50. For a 5-20 day horizon those react slowly and can give back a large part of a gain. The chandelier stop trails the recent high by a volatility-scaled distance, and the SMA20 Reduce step responds earlier without exiting the whole position. RSI14 at/above 70, an unfinished daily decline, and bearish intraday evidence still do not independently override Hold. A new-entry Wait and a holding Hold can coexist for the same market assessment.
 
 ## Triggers, invalidation, and conflicting evidence
 
-The panel includes the intended timeframe, values/dates for both daily bars, one-session SMA slopes, RSI14, SMA20 extension, the two intraday bars/VWAPs and their ending times, session open, and relevant freshness status. It states the daily trigger, intraday confirmation, and holding exit condition separately, so a condition that has not occurred is not described as a confirmed crossover or reclaim.
+The panel includes the intended timeframe, values/dates for both daily bars, one-session SMA slopes, RSI14, SMA20 extension, every entry gate with its value, the score breakdown, the intraday bars/VWAPs and their ending times, the chandelier level and relevant freshness status.
 
-- For a bullish daily setup, a subsequent completed daily close at/below the then-current SMA20 or loss of the strict uptrend invalidates that strict setup. RSI14 leaving `[50, 70)` or daily/intraday price exceeding the 3% SMA20-extension limit also invalidates the entry conditions. Loss of the broader SMA50/MA ordering undermines the directional bias. Recompute the moving averages from the new completed data; today's printed level is only the current reference.
-- Intraday entry confirmation is invalidated by a completed intraday close at/below the confirmed daily SMA20, loss of the defined two-bar Bullish condition against each bar's session VWAP and the session open, or expiry of the freshness/current-session requirements. A single provisional bar cannot confirm or invalidate a completed-bar trigger.
-- For holding exits, the actual bearish classification or verified two-bar SMA50 breakdown is identified as occurred; otherwise those exit conditions remain pending. A recovery requires evaluating new consecutive completed bars and their recalculated moving averages.
-- The result explicitly reports contradictory momentum, overbought/oversold conditions, daily/intraday disagreement, excessive extension, missing confirmation, historical-session evidence, and provisional observations when applicable.
+- For a bullish daily setup, a subsequent completed daily close below the then-current SMA20 or loss of the strict uptrend invalidates that setup. RSI14 leaving `[50, 70)`, price running more than 1.5 ATR above SMA20, SPY falling below its SMA200, an approaching earnings date, or the score dropping below 60 also invalidates the entry conditions. Recompute the moving averages from the new completed data; today's printed level is only the current reference.
+- For holding exits, an occurred Sell or Reduce condition is identified as occurred; otherwise those exit conditions remain pending. A recovery requires evaluating new consecutive completed bars and their recalculated moving averages.
+- The result explicitly reports contradictory momentum, overbought/oversold conditions, daily/intraday disagreement, excessive extension, unverifiable conditional gates, historical-session evidence, and provisional observations when applicable.
 
-These conditions describe when to reassess. They do not supply invented stops, targets, support/resistance, guaranteed execution prices, or personalized trading suitability.
+These conditions describe when to reassess. The chandelier level is a rule-based trailing reference, not a guaranteed execution price, and nothing here supplies targets or personalized trading suitability.
+
+## Backtesting
+
+`scripts/backtest.py` replays `evaluate_bar` over real FMP daily history (default: 15 large caps, 6 years):
+
+```powershell
+.\.venv\Scripts\python scripts\backtest.py
+.\.venv\Scripts\python scripts\backtest.py NVDA AAPL MSFT --years 8 --ablation
+```
+
+Each decision uses only completed bars up to that session. Orders fill at the next session's open with a per-side cost (default 5 bps). Reduce sells half, Sell closes the rest. The report shows, per symbol, trade count, win rate, average/median trade, profit factor, strategy return, max drawdown, time in market and buy-and-hold return. It also buckets every session by score and reports the average 10-session forward return per bucket, which shows whether a higher score has actually preceded better returns. `--ablation` reruns the test with each gate removed (score, SPY, SMA200, earnings, chandelier stop) so you can see what each one contributes. `--with-sr` recomputes support/resistance each day so the reward/risk component is included; it is slow. CSV files are written to `artifacts/backtest/`.
+
+Limits: the default symbol list is today's large caps, so results carry survivorship bias. The test ignores slippage beyond the cost, overnight gaps through a stop, taxes and position sizing. Treat it as a check on whether the rules behave sensibly, not a forecast.
 
 ## Focused verification
 
-`tests/test_signals.py` uses isolated synthetic fixtures to cover bullish, bearish, conflicting, overbought-uptrend, insufficient/stale daily, unavailable intraday, and provisional-bar cases. It also checks that holding status selects different guidance without changing the shared market assessment. Fixtures verify implementation against the rules; they measure neither historical trading performance nor prediction accuracy.
+`tests/test_signals.py` uses isolated synthetic fixtures to cover bullish, bearish, conflicting, overbought-uptrend, insufficient/stale daily, unavailable intraday, provisional-bar, pullback-trigger, market-gate, earnings-gate, SMA200, score, Reduce and chandelier cases. It also checks that holding status selects different guidance without changing the shared market assessment. `tests/test_strategy.py` covers ATR, Fibonacci legs, volume ratios, gap handling, benchmark alignment, the context fetch, held/failed zone tests and a no-look-ahead backtest check; `tests/test_backtest_script.py` runs the backtest command offline. Fixtures verify implementation against the rules; they measure neither historical trading performance nor prediction accuracy.

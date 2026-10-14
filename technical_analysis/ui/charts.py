@@ -42,8 +42,10 @@ def _price_volume(frame: pd.DataFrame, intraday: bool) -> go.Figure:
             name=name, increasing_line_color=UP, decreasing_line_color=DOWN,
             opacity=1 if completed else 0.4, hovertext=hover, hoverinfo="text"), row=1, col=1)
     overlays = [("vwap", "VWAP · 5 分钟估算", GOLD)] if intraday else [
-        ("sma20", "SMA20", GOLD), ("sma50", "SMA50", BLUE)]
+        ("sma20", "SMA20", GOLD), ("sma50", "SMA50", BLUE), ("sma200", "SMA200", MUTED)]
     for column, name, color in overlays:
+        if column not in frame:
+            continue
         figure.add_trace(go.Scatter(x=x, y=frame[column], mode="lines", name=name,
                                    line=dict(color=color, width=1.8), connectgaps=False,
                                    hovertemplate="%{y:.2f}<extra>" + name + "</extra>"), row=1, col=1)
@@ -62,7 +64,7 @@ def _price_volume(frame: pd.DataFrame, intraday: bool) -> go.Figure:
 
 def daily_chart(frame: pd.DataFrame, support_resistance: SupportResistanceResult | None = None,
                 *, show_zones: bool = True, show_profile: bool = True,
-                show_avwap: bool = True) -> go.Figure:
+                show_avwap: bool = True, show_fib: bool = False) -> go.Figure:
     """Overlay service results on the price subplot, leaving volume separate."""
     figure = _price_volume(frame, intraday=False)
     if support_resistance is None or not support_resistance.available or frame.empty:
@@ -101,6 +103,13 @@ def daily_chart(frame: pd.DataFrame, support_resistance: SupportResistanceResult
                 meta={"anchor_id": anchor.anchor_id}, mode="lines", connectgaps=False,
                 line=dict(color=color, width=1.6, dash="dash"),
                 hovertemplate="%{y:.2f}<extra>" + anchor.label + "</extra>"), row=1, col=1)
+    fib = getattr(support_resistance, "fibonacci", None)
+    if show_fib and fib is not None:
+        for ratio, level in fib.levels:
+            figure.add_hline(y=level, line=dict(color=GOLD, width=0.7, dash="dash"), opacity=0.6,
+                             row=1, col=1, annotation_text=f"Fib {ratio:.1%}",
+                             annotation_position="bottom left", annotation_font_size=9,
+                             annotation_font_color=GOLD)
     # Off-screen historical zones must not stretch the visible candle scale.
     low, high = float(frame["low"].min()), float(frame["high"].max())
     padding = (high - low) * 0.06 if high > low else high * 0.01

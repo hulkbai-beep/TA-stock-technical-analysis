@@ -98,6 +98,16 @@ Latest AVWAP contributes dynamic confluence only when it lies inside a static
 zone or within **0.50 latest ATR** of its nearest boundary. It never creates a
 standalone static zone. Its source pivot and daily-bar approximation are disclosed.
 
+## D. Fibonacci confluence
+
+The window-end Fibonacci leg is the highest high and lowest low of the latest
+**126 sessions** (or the window, if shorter); the leg is an advance when the high
+is the more recent extreme. Retracements 23.6/38.2/50/61.8/78.6% are reported and
+can be drawn on the chart. A 38.2/50/61.8% level inside a zone or within
+**0.25 latest ATR** of its nearest boundary adds the `fibonacci` method and its
+structure weight. Like AVWAP, Fibonacci never creates or widens a zone: its
+published evidence is weaker than swing or volume evidence, so it only confirms.
+
 ## Consolidation, interactions, and validity
 
 Nearby candidates use a **0.25 ATR** merge tolerance and a **2.5 ATR** maximum
@@ -121,6 +131,12 @@ missing dates cannot supply that separation. Reaction magnitude requires five fu
 continuous completed sessions after the event, and a known incoming direction.
 It measures favorable excursion beyond the relevant boundary divided by event ATR.
 Insufficient horizons or ambiguous direction produce unavailable reaction values.
+Each test also records whether it **held**: approached from above (support), no
+completed close during the event or on the bar that left it fell below the lower
+boundary; approached from below (resistance), none rose above the upper boundary.
+Earlier versions counted every touch as strength, so a level that price kept
+slicing through scored as well as one that kept holding. Now a test that closed
+through the zone subtracts half a test, and the panel shows held/failed counts.
 These descriptive counts do not imply the zone was known or tradable at those dates.
 
 Break/retest validity is separate and starts only once static geometry is available.
@@ -143,9 +159,9 @@ All components are normalized to `[0,1]`; defaults are provisional, configurable
 
 | Component | Weight | Normalization |
 | --- | --- | --- |
-| Independent interactions | 30% | `min((1.5*recent_tests + older_tests)/6, 1)` |
+| Independent interactions | 30% | `clip((1.5*recent + older)/6, 0, 1)`, where a held test counts +1 and a test that closed through the zone counts -0.5 |
 | Estimated volume concentration | 25% | `min(relative_volume_density/3, 1)` |
-| Structural confluence | 20% | Swing family 0.4 + HVN family 0.4 + AVWAP family 0.2 |
+| Structural confluence | 20% | Swing family 0.35 + HVN family 0.35 + AVWAP family 0.15 + Fibonacci family 0.15 |
 | Observed reaction magnitude | 15% | `min(mean_observed_reaction_ATR/3, 1)` |
 | Recency | 10% | `exp(-sessions_since_latest_test/(recent_sessions/2))` |
 
@@ -181,7 +197,8 @@ price; out-of-visible-range zones remain in the table without stretching candles
 
 The Chinese panel includes boundaries, distance, score, methods, retrospective test
 count, last interaction, status, anchor/confirmation dates, HVN/LVN statistics and
-score breakdowns. Controls change analysis window, maximum zones and display layers.
+score breakdowns, held/failed test counts and the Fibonacci table. Controls change
+analysis window, maximum zones and display layers, including Fibonacci lines.
 
 Tests cover each method, horizontal levels, trends, consolidation, gaps, low/zero
 volume, missing/duplicate/invalid data, adjusted-price scale invariance, confirmation

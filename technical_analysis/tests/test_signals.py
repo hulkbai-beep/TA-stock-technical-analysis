@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from analysis.signals import evaluate_signals
+from analysis.signals import MarketContext, evaluate_signals
 
 
 NY = ZoneInfo("America/New_York")
@@ -25,6 +25,19 @@ def _daily():
         "sma20": [99.8, 100.0],
         "sma50": [94.8, 95.0],
         "rsi14": [58.0, 60.0],
+        "sma200": [89.9, 90.0],
+        "atr14": [2.0, 2.0],
+        "high22": [102.0, 102.0],
+        "prev_high": [100.2, 100.8],
+        "pullback_atr5": [0.1, 0.2],
+        "updown_volume20": [1.4, 1.4],
+        "ret63": [0.12, 0.12],
+        "ret126": [0.20, 0.20],
+        "mkt_close": [500.0, 500.0],
+        "mkt_sma50": [490.0, 490.0],
+        "mkt_sma200": [470.0, 470.0],
+        "mkt_ret63": [0.05, 0.05],
+        "mkt_ret126": [0.08, 0.08],
     })
 
 
@@ -44,13 +57,14 @@ def _intraday():
     })
 
 
-def _assess(daily=None, intraday=None, *, now=NOW, retrieved_at=None):
+def _assess(daily=None, intraday=None, *, now=NOW, retrieved_at=None, context=None):
     return evaluate_signals(
         _daily() if daily is None else daily,
         _intraday() if intraday is None else intraday,
         now=now,
         daily_retrieved_at=retrieved_at or now,
         intraday_retrieved_at=retrieved_at or now,
+        context=context or MarketContext(earnings_checked=True),
     )
 
 
@@ -89,7 +103,7 @@ def test_bearish_daily_and_oversold_rsi_produce_reduce_not_automatic_buy():
     assert result.position.invalidation
 
 
-def test_daily_uptrend_with_bearish_intraday_waits_for_entry_but_holds():
+def test_bearish_intraday_is_a_timing_note_not_an_entry_blocker():
     intraday = _intraday()
     intraday["close"] = [100.4, 100.2]
 
@@ -97,9 +111,9 @@ def test_daily_uptrend_with_bearish_intraday_waits_for_entry_but_holds():
 
     assert result.daily.code == "strong_bullish"
     assert result.intraday.code == "bearish"
-    assert result.entry.code == "wait"
+    assert result.entry.code == "buy"
     assert result.position.code == "hold"
-    assert result.entry.conflicts or result.daily.conflicts
+    assert any("盘中偏空" in item for item in result.entry.conflicts)
 
 
 def test_overbought_uptrend_remains_strong_with_wait_and_hold():
@@ -141,12 +155,12 @@ def test_loose_bullish_trend_does_not_automatically_offer_entry():
     assert result.position.code == "hold"
 
 
-def test_unavailable_intraday_preserves_daily_assessment_without_confirmation():
+def test_unavailable_intraday_preserves_daily_entry_decision():
     result = _assess(intraday=_intraday().iloc[:0].copy())
 
     assert result.daily.code == "strong_bullish"
     assert result.intraday.code == "unavailable"
-    assert result.entry.code == "wait"
+    assert result.entry.code == "buy"
     assert result.position.code == "hold"
 
 
@@ -185,7 +199,7 @@ def test_forming_intraday_bar_cannot_supply_second_confirmation():
 
     assert result.intraday == baseline.intraday
     assert result.intraday.code == "neutral"
-    assert result.entry.code == "wait"
+    assert result.entry.code == baseline.entry.code
     assert any("临时观察" in note for note in result.provisional_notes)
 
 
@@ -202,9 +216,10 @@ def test_finite_indicators_do_not_bridge_nonconsecutive_daily_sessions():
     assert result.position.code == "insufficient_data"
 
 
-def test_entry_trigger_requires_verified_reclaim_or_rising_continuation():
+def test_entry_trigger_requires_reclaim_or_pullback_then_resumption():
     daily = _daily()
     daily.loc[0, "close"] = 101.5
+    daily.loc[1, "prev_high"] = 101.8
     pending = _assess(daily)
     assert pending.daily.code == "strong_bullish"
     assert pending.entry.code == "wait"
@@ -221,7 +236,7 @@ def test_entry_trigger_requires_verified_reclaim_or_rising_continuation():
     (datetime(2025, 5, 5, 10, 12, tzinfo=NY), ["2025-05-05 09:50", "2025-05-05 09:55"]),
     (datetime(2025, 5, 2, 16, 3, tzinfo=NY), ["2025-05-02 15:50", "2025-05-02 15:55"]),
 ], ids=["historical-session", "stale-twelve-minutes", "after-hours"])
-def test_ineligible_intraday_session_age_or_market_hours_cannot_confirm_entry(now, stamps):
+def test_entry_is_decided_on_completed_daily_bars_whatever_the_intraday_age(now, stamps):
     intraday = _intraday()
     stamps = pd.DatetimeIndex(stamps, tz=NY)
     intraday["session"] = stamps.date
@@ -230,7 +245,7 @@ def test_ineligible_intraday_session_age_or_market_hours_cannot_confirm_entry(no
 
     result = _assess(intraday=intraday, now=now)
 
-    assert result.entry.code == "wait"
+    assert result.entry.code == "buy"
     assert result.position.code == "hold"
 
 
@@ -254,7 +269,7 @@ def test_current_gap_up_is_unattractive_even_when_daily_close_was_near_sma20():
     assert result.position.code == "hold"
 
 
-def test_rsi70_is_excluded_but_three_percent_entry_extension_is_included():
+def test_rsi70_is_excluded_but_the_extension_limit_is_inclusive():
     daily = _daily()
     daily.loc[1, "rsi14"] = 70.0
     assert _assess(daily).entry.code == "wait"
@@ -274,7 +289,6 @@ def test_missing_session_coverage_is_unavailable_rather_than_neutral():
     result = _assess(intraday=intraday)
 
     assert result.intraday.code == "unavailable"
-    assert result.entry.code == "wait"
 
 
 def test_two_daily_closes_below_sma50_reduce_even_without_bearish_ma_order():
@@ -286,3 +300,96 @@ def test_two_daily_closes_below_sma50_reduce_even_without_bearish_ma_order():
     assert result.daily.code == "neutral"
     assert result.entry.code == "wait"
     assert result.position.code == "reduce_sell"
+
+
+def test_pullback_trigger_needs_a_recent_touch_of_sma20():
+    daily = _daily()
+    daily.loc[1, "pullback_atr5"] = 1.2
+
+    result = _assess(daily)
+
+    assert result.decision.trigger is None
+    assert result.entry.code == "wait"
+
+
+def test_weak_market_blocks_new_entries_but_not_holding():
+    daily = _daily()
+    daily["mkt_close"] = [460.0, 460.0]
+
+    result = _assess(daily)
+
+    assert result.entry.code == "wait"
+    assert result.entry_attractiveness == "大盘弱势，暂缓新开仓"
+    assert result.position.code == "hold"
+
+
+def test_missing_market_data_is_reported_not_silently_passed():
+    daily = _daily()
+    for column in ("mkt_close", "mkt_sma50", "mkt_sma200", "mkt_ret63", "mkt_ret126"):
+        daily[column] = np.nan
+
+    result = _assess(daily)
+
+    assert result.entry.code == "buy"
+    assert any("大盘环境" in item for item in result.entry.conflicts)
+    regime = next(item for item in result.score.components if item.name == "market_regime")
+    assert regime.value is None and regime.effective_weight == 0
+
+
+def test_upcoming_earnings_blocks_entry():
+    context = MarketContext(next_earnings=date(2025, 5, 7), earnings_checked=True)
+
+    result = _assess(context=context)
+
+    assert result.entry.code == "wait"
+    assert result.entry_attractiveness == "临近财报，等待事件落地"
+
+
+def test_price_below_sma200_blocks_entry():
+    daily = _daily()
+    daily["sma200"] = [102.0, 102.0]
+
+    assert _assess(daily).entry.code == "wait"
+
+
+def test_low_score_blocks_entry():
+    daily = _daily()
+    daily["ret63"] = [-0.30, -0.30]
+    daily["ret126"] = [-0.30, -0.30]
+    daily["updown_volume20"] = [0.5, 0.5]
+    daily["mkt_sma50"] = [480.0, 460.0]
+    daily["rsi14"] = [51.0, 52.0]
+
+    result = _assess(daily)
+
+    assert result.score.score < 60
+    assert result.entry.code == "wait"
+
+
+def test_score_weights_sum_and_breakdown_are_reported():
+    result = _assess()
+
+    assert result.score.score is not None and 60 <= result.score.score <= 100
+    assert abs(sum(item.effective_weight for item in result.score.components) - 1) < 1e-9
+    assert {item.name for item in result.score.components} == {
+        "trend", "relative_strength", "market_regime", "momentum", "location", "volume", "reward_risk"}
+
+
+def test_two_closes_below_sma20_reduce_without_selling():
+    daily = _daily()
+    daily["close"] = [99.5, 99.6]
+
+    result = _assess(daily)
+
+    assert result.position.code == "reduce"
+
+
+def test_chandelier_stop_sells_inside_an_intact_ma_structure():
+    daily = _daily()
+    daily["high22"] = [108.0, 108.0]
+
+    result = _assess(daily)
+
+    assert result.daily.code == "strong_bullish"
+    assert result.position.code == "reduce_sell"
+    assert any("吊灯止损" in item for item in result.position.conditions)

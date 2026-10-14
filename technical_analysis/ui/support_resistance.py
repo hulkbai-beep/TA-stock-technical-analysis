@@ -8,7 +8,8 @@ import streamlit as st
 from analysis.support_resistance.models import SupportResistanceResult, Zone
 from ui.charts import volume_profile_chart
 
-METHODS = {"swing": "摆动价格簇", "volume_profile": "估算成交量分布", "anchored_vwap": "AVWAP 共振"}
+METHODS = {"swing": "摆动价格簇", "volume_profile": "估算成交量分布", "anchored_vwap": "AVWAP 共振",
+           "fibonacci": "斐波那契共振"}
 KINDS = {"support": "支撑", "resistance": "阻力", "interaction": "价格互动"}
 STATUSES = {"active": "有效", "broken": "已突破 · 待回测确认", "under_retest": "回测中"}
 COMPONENTS = {"tests": "独立互动", "volume": "估算量密度", "structure": "结构共振", "reaction": "历史反应幅度", "recency": "近期相关性"}
@@ -32,6 +33,7 @@ def _zone_rows(zones: tuple[Zone, ...]) -> list[dict]:
         "支持方法": " / ".join(METHODS.get(method, method) for method in zone.methods),
         "回顾独立互动": zone.independent_tests,
         "近期互动": zone.recent_tests,
+        "守住 / 穿越": f"{zone.held_tests} / {zone.failed_tests}",
         "最近互动": str(zone.latest_test) if zone.latest_test else "无已确认互动",
         "状态": STATUSES[zone.status],
     } for zone in zones]
@@ -76,7 +78,7 @@ def render_support_resistance(result: SupportResistanceResult, *, show_profile: 
             _details(zone)
     else:
         st.info(result.reason or "当前证据不足，未强制生成支撑或阻力区间。")
-    st.caption("强度为解释性评分，非成功概率；排名同时考虑距离。连续触及属于同一次互动，完整反应观察窗口不足时不计算反应幅度。超出图表可视价格范围的区间可在表格中查看。")
+    st.caption("强度为解释性评分，非成功概率；排名同时考虑距离。连续触及属于同一次互动；“守住”指互动期间收盘未穿越区间另一侧，穿越的测试会降低强度。完整反应观察窗口不足时不计算反应幅度。超出图表可视价格范围的区间可在表格中查看。")
 
     profile_column, anchor_column = st.columns([1.3, 1], gap="medium")
     with profile_column:
@@ -114,6 +116,13 @@ def render_support_resistance(result: SupportResistanceResult, *, show_profile: 
             st.caption("从确认的主要摆动高/低点累计 HLC3×成交量；曲线在锚点确认后才显示。仅在距离静态区间足够近时计入共振。")
         else:
             st.info("尚无可用的已确认主要摆动锚点，或锚点之后的数据覆盖不完整。")
+    fib = getattr(result, "fibonacci", None)
+    if fib is not None:
+        st.markdown("**斐波那契回撤 · 最近 "
+                    f"{result.config.fib_lookback_sessions} 个交易日的{'上涨' if fib.up else '下跌'}波段**")
+        st.dataframe(pd.DataFrame([{"回撤比例": f"{ratio:.1%}", "价格": round(level, 2)} for ratio, level in fib.levels]),
+                     hide_index=True, use_container_width=True)
+        st.caption(f"波段 {fib.low:.2f}–{fib.high:.2f}。斐波那契位只在与摆动或成交量区间重合时计入共振，不单独生成支撑/阻力。")
     broken = tuple(zone for zone in result.zones if zone.status == "broken")
     if broken:
         with st.expander(f"已突破区间 · {len(broken)} 个（不列入有效支撑/阻力排名）"):

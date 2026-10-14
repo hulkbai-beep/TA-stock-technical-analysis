@@ -202,7 +202,7 @@ def test_sr_controls_recompute_from_cached_history_without_fetching(monkeypatch)
     assert not app.exception
     assert app.selectbox(key="sr_window").value == "12 个月 · 252 个交易日"
     assert app.selectbox(key="sr_count").value == 3
-    assert all(item.value for item in app.checkbox)
+    assert [item.value for item in app.checkbox] == [True, True, True, False]
     charts_with_profile = len(app.get("plotly_chart"))
     app.checkbox[1].set_value(False).run(timeout=20)
     assert not app.exception
@@ -211,7 +211,9 @@ def test_sr_controls_recompute_from_cached_history_without_fetching(monkeypatch)
     app.selectbox(key="sr_count").set_value(5).run(timeout=20)
     app.checkbox[0].set_value(False).run(timeout=20)
     app.checkbox[2].set_value(False).run(timeout=20)
+    app.checkbox[3].set_value(True).run(timeout=20)
     assert not app.exception
+    assert any("综合评分" in metric.label for metric in app.metric)
     assert calls == [("NVDA", False)]
     assert any("最近 126 个交易日" in item.value for item in app.caption)
 
@@ -372,7 +374,9 @@ def test_new_daily_close_refreshes_automatically_and_preserves_controls(monkeypa
     app.selectbox(key="sr_window").set_value("6 个月 · 126 个交易日").run(timeout=20)
     app.selectbox(key="sr_count").set_value(5).run(timeout=20)
     app.checkbox[2].set_value(False).run(timeout=20)
+    app.checkbox[3].set_value(True).run(timeout=20)
     assert not app.exception
+    assert any("综合评分" in metric.label for metric in app.metric)
     assert calls == [("NVDA", False)] and peeks == []
 
     epoch["value"] = next_close
@@ -615,6 +619,7 @@ def test_auto_refresh_does_not_overlap_and_backs_off_after_failure(monkeypatch):
 
 
 def test_assessment_expires_on_fragment_tick_even_with_fetching_off(monkeypatch):
+    """A daily close that becomes stale withdraws the Buy without any new fetch."""
     from inspect import getclosurevars
     from streamlit.testing.v1 import local_script_runner
 
@@ -623,6 +628,8 @@ def test_assessment_expires_on_fragment_tick_even_with_fetching_off(monkeypatch)
     for index, close, sma20, sma50 in zip(daily.index[-2:], [100.5, 101], [99.8, 100], [94.8, 95]):
         daily.loc[index, ["open", "high", "low", "close", "sma20", "sma50", "rsi14"]] = [
             close, close + 0.5, close - 0.5, close, sma20, sma50, 60]
+    daily.loc[daily.index[-1], ["atr14", "prev_high", "pullback_atr5", "high22", "updown_volume20", "sma200"]] = [
+        2.0, 100.8, 0.2, 102.0, 1.4, 90.0]
     stamps = pd.DatetimeIndex(["2026-10-12 09:50", "2026-10-12 09:55"], tz=NEW_YORK)
     intraday = pd.DataFrame({
         "session": stamps.date, "timestamp": stamps, "bar_end": stamps + pd.Timedelta("5min"),
@@ -651,12 +658,12 @@ def test_assessment_expires_on_fragment_tick_even_with_fetching_off(monkeypatch)
     # fragment through its runner, as the browser's periodic event would do.
     fragment_id = next(key for key, fn in app._fragment_storage._fragments.items()
                        if getclosurevars(fn).nonlocals["non_optional_func"].__name__ == "render_current_assessment")
-    clock["now"] = datetime(2026, 10, 12, 10, 11, tzinfo=NEW_YORK)
+    clock["now"] = datetime(2026, 10, 13, 16, 5, tzinfo=NEW_YORK)
     rerun_data = local_script_runner.RerunData
     with monkeypatch.context() as patch:
         patch.setattr(local_script_runner, "RerunData",
                       lambda **kwargs: rerun_data(**kwargs, fragment_id=fragment_id))
         app.run(timeout=20)
     assert not app.exception
-    assert next(metric.value for metric in app.metric if metric.label == "操作参考") == "等待"
+    assert next(metric.value for metric in app.metric if metric.label == "操作参考") == "数据不足"
     assert calls == ["NVDA"]

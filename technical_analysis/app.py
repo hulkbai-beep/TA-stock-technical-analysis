@@ -192,7 +192,7 @@ with st.sidebar:
     st.caption("第一版 · 价格与成交量")
     st.divider()
     st.markdown("**观察框架**")
-    st.markdown("日线趋势　SMA20 / SMA50\n\n动量变化　RSI14\n\n日内位置　VWAP")
+    st.markdown("日线趋势　SMA20 / SMA50 / SMA200\n\n动量变化　RSI14\n\n大盘与相对强度　SPY / 行业 ETF\n\n波动与止损　ATR14\n\n日内位置　VWAP")
     st.divider()
     st.caption("数据来源：FMP\n\n美股常规交易时段\n\nAmerica/New_York")
     st.caption("复用已校验行情 · 新交易K线自动失效\n\n最新可用数据的延迟取决于账户权限。")
@@ -286,10 +286,11 @@ with st.expander("支撑/阻力设置", expanded=True):
     window_column, count_column = st.columns(2)
     sr_window = window_column.selectbox("结构分析窗口", ["12 个月 · 252 个交易日", "6 个月 · 126 个交易日"], key="sr_window")
     sr_count = count_column.selectbox("每侧最多显示区间", [2, 3, 5], index=1, key="sr_count")
-    zone_column, profile_column, avwap_column = st.columns(3)
+    zone_column, profile_column, avwap_column, fib_column = st.columns(4)
     show_zones = zone_column.checkbox("显示支撑/阻力区", value=True, key="show_sr_zones")
     show_profile = profile_column.checkbox("显示估算成交量分布", value=True, key="show_sr_profile")
     show_avwap = avwap_column.checkbox("显示 AVWAP", value=True, key="show_sr_avwap")
+    show_fib = fib_column.checkbox("显示斐波那契", value=False, key="show_sr_fib")
 sr_config = SRConfig(lookback_sessions=252 if sr_window.startswith("12") else 126,
                      max_zones_per_side=sr_count)
 sr_result = support_resistance_for(result, sr_config)
@@ -300,7 +301,7 @@ with chart_column:
     st.subheader(f"日线走势 · {range_label}")
     shown_daily = visible_daily(result.daily, range_label)
     st.plotly_chart(daily_chart(shown_daily, sr_result, show_zones=show_zones,
-                               show_profile=show_profile, show_avwap=show_avwap),
+                               show_profile=show_profile, show_avwap=show_avwap, show_fib=show_fib),
                     use_container_width=True, config=plot_config)
     st.caption("浅色 K 线为未完成日线，相关指标暂定。价格按拆股调整；成交量仅按数据原值显示。")
     st.subheader("RSI14 · 日线动量")

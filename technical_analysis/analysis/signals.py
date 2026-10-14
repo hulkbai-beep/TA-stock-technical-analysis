@@ -1,8 +1,9 @@
 """Deterministic technical heuristics over completed, dated market bars.
 
-These initial rules are not backtested strategies. Daily trend, RSI momentum,
-and current-session timing remain separate; no portfolio facts are inferred.
-The caller supplies already-calculated SMA20, SMA50, RSI14, and session VWAP.
+Daily trend, RSI momentum, and current-session timing remain separate; no
+portfolio facts are inferred. The bar-level rules and the weighted score live
+in `analysis/strategy.py`, shared with the backtest. The caller supplies
+already-calculated daily features (see `daily_indicators`) and session VWAP.
 """
 from __future__ import annotations
 
@@ -12,10 +13,11 @@ from math import isfinite
 
 import pandas as pd
 
+from analysis.strategy import BarDecision, StrategyConfig, TechnicalScore, classify_daily, evaluate_bar
 from data.normalize import session_schedule
 
 
-TIMEFRAME = "日线／波段观察（约 5–20 个交易日）；5 分钟仅用于当日入场时机。"
+TIMEFRAME = "日线／波段观察（约 5–20 个交易日）；按已完成日线决策，5 分钟仅用于避免追高。"
 REFERENCE_NOTE = "均线与 VWAP 是随新K线更新的计算参考位，不是固定止损价或目标价。"
 
 
@@ -52,6 +54,19 @@ class TechnicalAssessment:
     position: ActionGuidance
     evaluated_at: datetime
     provisional_notes: tuple[str, ...]
+    score: TechnicalScore | None = None
+    decision: BarDecision | None = None
+    context_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MarketContext:
+    """Event and benchmark facts gathered outside the stock's own bars."""
+    next_earnings: date | None = None
+    earnings_checked: bool = False
+    sector: str | None = None
+    sector_etf: str | None = None
+    notes: tuple[str, ...] = ()
 
 
 def _local(value: datetime | pd.Timestamp) -> pd.Timestamp:
@@ -102,7 +117,17 @@ def _momentum(rsi: float) -> str:
     return "偏弱且超卖"
 
 
-def _daily_bias(bars: pd.DataFrame, expected_session: date | None) -> tuple[BiasAssessment, dict | None]:
+_BIAS_TEXT = {
+    "strong_bullish": ("强烈偏多", "收盘价高于 SMA20 和 SMA50，两条均线均上升，RSI14 至少为 55。"),
+    "bullish": ("偏多", "收盘价与 SMA20 均高于 SMA50，且 SMA50 未下降；尚未满足全部强势偏多条件。"),
+    "strong_bearish": ("强烈偏空", "收盘价低于 SMA20 和 SMA50，两条均线均下降，RSI14 不高于 45。"),
+    "bearish": ("偏空", "收盘价与 SMA20 均低于 SMA50，且 SMA50 未上升；尚未满足全部强势偏空条件。"),
+    "neutral": ("中性", "价格与均线结构未形成规则定义的明确多头或空头排列。"),
+}
+
+
+def _daily_bias(bars: pd.DataFrame, expected_session: date | None,
+                config: StrategyConfig) -> tuple[BiasAssessment, dict | None]:
     latest = None if bars.empty else bars.iloc[-1]
     stamp = None if latest is None else _local(latest["bar_end"]).to_pydatetime()
     session = None if latest is None else latest["session"]
@@ -122,18 +147,8 @@ def _daily_bias(bars: pd.DataFrame, expected_session: date | None) -> tuple[Bias
     close, sma20, sma50, rsi = (float(latest[column]) for column in ("close", "sma20", "sma50", "rsi14"))
     slope20 = sma20 - float(prior["sma20"])
     slope50 = sma50 - float(prior["sma50"])
-    strict_up = close > sma20 > sma50 and slope20 > 0 and slope50 > 0
-    strict_down = close < sma20 < sma50 and slope20 < 0 and slope50 < 0
-    if strict_up and rsi >= 55:
-        code, label, reason = "strong_bullish", "强烈偏多", "收盘价高于 SMA20 和 SMA50，两条均线均上升，RSI14 至少为 55。"
-    elif close > sma50 and sma20 > sma50 and slope50 >= 0:
-        code, label, reason = "bullish", "偏多", "收盘价与 SMA20 均高于 SMA50，且 SMA50 未下降；尚未满足全部强势偏多条件。"
-    elif strict_down and rsi <= 45:
-        code, label, reason = "strong_bearish", "强烈偏空", "收盘价低于 SMA20 和 SMA50，两条均线均下降，RSI14 不高于 45。"
-    elif close < sma50 and sma20 < sma50 and slope50 <= 0:
-        code, label, reason = "bearish", "偏空", "收盘价与 SMA20 均低于 SMA50，且 SMA50 未上升；尚未满足全部强势偏空条件。"
-    else:
-        code, label, reason = "neutral", "中性", "价格与均线结构未形成规则定义的明确多头或空头排列。"
+    code, strict_up, strict_down = classify_daily(prior, latest, config)
+    label, reason = _BIAS_TEXT[code]
     evidence = tuple(
         f"已完成日线 {_time(row['bar_end'])}：收盘 {float(row['close']):.2f}，SMA20 {float(row['sma20']):.2f}，SMA50 {float(row['sma50']):.2f}，RSI14 {float(row['rsi14']):.2f}。"
         for row in (prior, latest)
@@ -151,14 +166,10 @@ def _daily_bias(bars: pd.DataFrame, expected_session: date | None) -> tuple[Bias
         conflicts.append("趋势条件尚不一致；不能仅凭 RSI 或单一均线位置确认方向。")
     if session != expected_session:
         reason += f" 这是 {session} 的历史判断；缺少最新应完成交易日 {expected_session} 的有效数据，操作参考不可用。"
-    prior_close, prior_sma20 = float(prior["close"]), float(prior["sma20"])
-    reclaim = prior_close <= prior_sma20 and close > sma20
-    continuation = prior_close > prior_sma20 and close > sma20 and close > prior_close
     facts = {
         "prior": prior, "latest": latest, "close": close, "sma20": sma20, "sma50": sma50, "rsi": rsi,
         "strict_up": strict_up, "strict_down": strict_down, "gap": close / sma20 - 1,
-        "reclaim": reclaim, "continuation": continuation, "fresh": session == expected_session,
-        "two_below50": prior_close < float(prior["sma50"]) and close < sma50,
+        "fresh": session == expected_session,
     }
     return BiasAssessment(code, label, reason, evidence, tuple(conflicts), stamp, session), facts
 
@@ -216,86 +227,98 @@ def _unavailable_actions(reason: str, daily: BiasAssessment, intraday: BiasAsses
     return guidance, guidance
 
 
+_GATE_MARK = {"pass": "✓", "fail": "✗", "unknown": "？"}
+_GATE_NAMES = {
+    "strict_trend": "严格多头排列", "rsi_range": "RSI 入场区间", "extension": "距 SMA20 不追高",
+    "trigger": "日线触发", "long_trend": "SMA200 长期趋势", "market_regime": "大盘环境（SPY）",
+    "earnings": "财报事件风险", "score": "综合评分",
+}
+_GATE_WAIT = {
+    "strict_trend": "等待日线收盘 > SMA20 > SMA50，且两条均线均较前一交易日上升。",
+    "rsi_range": "等待已完成日线 RSI14 回到入场区间。",
+    "extension": "价格离 SMA20 过远，等待回调后再考虑，避免追高。",
+    "trigger": "等待日线触发：重新站上 SMA20，或回踩 SMA20 后收盘突破前一日高点。",
+    "long_trend": "股价低于 SMA200，长期趋势未确认，暂不新开仓。",
+    "market_regime": "SPY 低于其 SMA200，大盘处于弱势环境，暂不新开仓。",
+    "earnings": "临近财报，波段持仓会承担财报跳空风险，等待财报公布后再评估。",
+    "score": "综合评分不足，等待更多指标共振。",
+}
+
+
 def _actions(daily: BiasAssessment, intraday: BiasAssessment, facts: dict | None, intra_facts: dict | None,
-             market_open: bool, expected_session: date | None) -> tuple[str, ActionGuidance, ActionGuidance]:
-    if facts is None:
+             market_open: bool, expected_session: date | None, decision: BarDecision | None,
+             config: StrategyConfig) -> tuple[str, ActionGuidance, ActionGuidance]:
+    if facts is None or decision is None:
         entry, position = _unavailable_actions("已完成日线历史或指标不足，无法生成操作参考。", daily, intraday)
         return "数据不足", entry, position
     if not facts["fresh"]:
         entry, position = _unavailable_actions(f"最新日线为 {daily.session}；应完成交易日为 {expected_session}。请刷新或补足数据后再判断。", daily, intraday)
         return "数据不足", entry, position
     close, sma20, sma50, rsi = (facts[name] for name in ("close", "sma20", "sma50", "rsi"))
-    daily_trigger = facts["reclaim"] or facts["continuation"]
+    atr = facts["latest"].get("atr14") if hasattr(facts["latest"], "get") else None
+    atr = float(atr) if atr is not None and pd.notna(atr) and float(atr) > 0 else None
     conditions = [f"日线参考 {_time(daily.as_of)}：收盘 {close:.2f}，SMA20 {sma20:.2f}，SMA50 {sma50:.2f}，RSI14 {rsi:.2f}，距 SMA20 {facts['gap'] * 100:+.2f}%。"]
-    if facts["reclaim"]:
-        conditions.append("日线触发已发生：相邻两根已完成日线由前收盘不高于前 SMA20，转为最新收盘高于最新 SMA20（重新站上）。")
-    elif facts["continuation"]:
-        conditions.append("日线触发已发生：相邻两根已完成日线均收于各自 SMA20 上方，且最新收盘高于前收盘（延续确认）。")
-    else:
-        conditions.append("日线触发待确认：相邻两根已完成日线须确认重新站上 SMA20，或均在各自 SMA20 上方且最新收盘高于前收盘。")
-    blockers = []
-    if not facts["strict_up"]:
-        blockers.append("等待日线收盘 > SMA20 > SMA50，且两条均线均较前一交易日上升。")
-    if not 50 <= rsi < 70:
-        blockers.append(f"等待已完成日线 RSI14 回到 50（含）至 70（不含）；当前 {rsi:.2f}。")
-    if not sma20 <= close <= sma20 * 1.03:
-        blockers.append(f"等待日线收盘处于其 SMA20 {sma20:.2f} 上方 0%–3% 范围；当前距离 {facts['gap'] * 100:+.2f}%。")
-    if not daily_trigger:
-        blockers.append("等待上述由连续已完成日线验证的价格触发。")
-    if not market_open:
-        blockers.append("等待 NYSE 正常交易时段内的当日确认。")
-    if intra_facts is None:
-        blockers.append("盘中确认不可用：等待完整覆盖、VWAP 有效且连续的两根已完成 5 分钟K线。")
-    else:
-        if not intra_facts["current"]:
-            blockers.append("等待今日最新已完成 5 分钟K线，且结束时刻距评估不超过 10 分钟。")
-        if intraday.code != "bullish":
-            blockers.append("等待连续两根已完成 5 分钟收盘高于各自 VWAP，且最新收盘高于当日开盘。")
-        intra_gap = intra_facts["close"] / sma20 - 1
-        conditions.append(f"盘中参考 {_time(intraday.as_of)}：已完成收盘 {intra_facts['close']:.2f}，距日线 SMA20 {sma20:.2f} 为 {intra_gap * 100:+.2f}%。")
-        intra_confirmed = intra_facts["current"] and intraday.code == "bullish" and sma20 < intra_facts["close"] <= sma20 * 1.03
-        conditions.append("盘中入场触发已发生：今日新鲜的连续两根已完成 5 分钟K线确认偏多，且最新收盘高于日线 SMA20、偏离不超过 3%。" if intra_confirmed else "盘中入场触发待确认：需在当日正常交易时段内同时满足数据新鲜、连续两根K线偏多及 SMA20 价格距离条件。")
-        if not sma20 < intra_facts["close"] <= sma20 * 1.03:
-            blockers.append(f"等待已完成 5 分钟收盘高于日线 SMA20 {sma20:.2f} 且偏离不超过 3%，避免追逐跳空。")
-    conditions.extend(blockers)
-    conditions.append(REFERENCE_NOTE)
+    for gate in decision.gates:
+        suffix = "" if gate.required else "（数据缺失时不阻止，但需自行核实）" if gate.status == "unknown" else ""
+        conditions.append(f"{_GATE_MARK[gate.status]} {_GATE_NAMES[gate.name]}：{gate.detail}{suffix}")
+    blockers = [_GATE_WAIT[gate.name] for gate in decision.gates
+                if gate.status == "fail" or (gate.required and gate.status == "unknown")]
     conflicts = list(daily.conflicts + intraday.conflicts)
-    if intraday.code == "bearish" and daily.code in ("bullish", "strong_bullish"):
-        conflicts.append("日线偏多但盘中偏空：新入场需等待盘中确认，盘中信号不改变日线判断。")
+    conflicts.extend(f"{_GATE_NAMES[gate.name]}无法核实：{gate.detail}。" for gate in decision.gates
+                     if gate.status == "unknown" and not gate.required)
+    if intra_facts is not None:
+        intra_close = intra_facts["close"]
+        intra_gap = (intra_close - sma20) / atr if atr else intra_close / sma20 - 1
+        limit = config.max_extension_atr if atr else config.fallback_max_extension
+        gap_text = f"{intra_gap:+.2f} ATR" if atr else f"{intra_gap:+.2%}"
+        conditions.append(f"盘中参考 {_time(intraday.as_of)}：已完成收盘 {intra_close:.2f}，距日线 SMA20 {gap_text}。")
+        if intra_facts["current"] and intra_gap > limit:
+            blockers.append(f"今日盘中价格已偏离日线 SMA20 {gap_text}，超过不追高上限；等待回落。")
+        if intraday.code == "bearish" and daily.code in ("bullish", "strong_bullish"):
+            conflicts.append("日线偏多但盘中偏空：入场时机可等待盘中转强；盘中信号不改变日线判断。")
     if intraday.code == "bullish" and daily.code in ("bearish", "strong_bearish"):
         conflicts.append("盘中偏多与日线偏空相冲突；盘中反弹不覆盖日线退出条件。")
+    conditions.append(REFERENCE_NOTE)
     entry_invalidation = (
-        f"后续已完成日线收盘不再高于其 SMA20（当前参考 {sma20:.2f}），或严格多头排列／两条均线同时上升条件消失。",
-        "已完成日线 RSI14 离开 50（含）至 70（不含）范围，或日线／盘中价格偏离日线 SMA20 超过 3%。",
-        f"最新已完成 5 分钟收盘回到日线 SMA20（当前参考 {sma20:.2f}）或下方，盘中入场价格条件失效。",
-        "当日连续两根已完成 5 分钟K线不再同时位于各自 VWAP 上方，最新收盘不再高于当日开盘，或盘中数据过期／不可用。",
+        f"后续已完成日线收盘跌回 SMA20（当前参考 {sma20:.2f}）下方，或严格多头排列消失。",
+        f"RSI14 离开 [{config.entry_rsi_low:g}, {config.entry_rsi_high:g})，或价格偏离 SMA20 超过 {config.max_extension_atr:g} ATR。",
+        "SPY 跌破其 SMA200、临近财报，或综合评分跌破入场门槛。",
     )
     if not blockers:
         attractiveness = "入场条件已满足"
-        entry = ActionGuidance("buy", "买入", "日线趋势、动量、价格距离与当日盘中确认共同满足初始规则，可考虑技术性入场。", TIMEFRAME, "已触发", tuple(conditions), entry_invalidation, tuple(conflicts))
+        entry = ActionGuidance("buy", "买入", "已完成日线的趋势、动量、位置、触发、大盘和综合评分均满足规则，可在当前或下一交易时段考虑入场。",
+                               TIMEFRAME, "已触发", tuple(conditions), entry_invalidation, tuple(conflicts))
     else:
-        if rsi >= 70:
+        failed = {gate.name for gate in decision.gates if gate.status == "fail"}
+        if rsi >= config.entry_rsi_high:
             attractiveness = "超买，等待入场条件"
-        elif close > sma20 * 1.03:
-            attractiveness = "日线偏离 SMA20 超过 3%，等待确认"
-        elif intra_facts is not None and intra_facts["close"] > sma20 * 1.03:
-            attractiveness = "盘中偏离 SMA20 超过 3%，等待确认"
+        elif "extension" in failed:
+            attractiveness = "偏离 SMA20 过远，等待回调"
+        elif "market_regime" in failed:
+            attractiveness = "大盘弱势，暂缓新开仓"
+        elif "earnings" in failed:
+            attractiveness = "临近财报，等待事件落地"
         else:
             attractiveness = "等待入场确认"
-        entry = ActionGuidance("wait", "等待", blockers[0] + " 技术强弱与入场吸引力分开判断。", TIMEFRAME, "等待确认", tuple(conditions), entry_invalidation, tuple(conflicts))
-    exit_triggered = daily.code in ("bearish", "strong_bearish") or facts["two_below50"]
-    position_conditions = [f"已完成日线依据 {_time(daily.as_of)}；当前 SMA50 参考 {sma50:.2f}。"]
-    if exit_triggered:
-        if daily.code in ("bearish", "strong_bearish"):
-            position_conditions.append("退出触发已发生：已完成日线符合偏空或强势偏空规则。")
-        if facts["two_below50"]:
-            position_conditions.append("退出触发已发生：相邻两根已完成日线收盘均低于各自 SMA50。")
-        invalidation = (f"后续已完成日线收盘回到其 SMA50（当前 {sma50:.2f}）或上方，且不再符合偏空规则，也不再连续两日收于各自 SMA50 下方时，重新评估减仓／卖出依据。",)
-        position = ActionGuidance("reduce_sell", "减仓或卖出", "已完成日线已触发趋势转弱退出规则，可考虑减仓或卖出；不依据单独的超买或 VWAP 位置退出。", TIMEFRAME, "已触发", tuple(position_conditions) + (REFERENCE_NOTE,), invalidation, tuple(conflicts))
+        entry = ActionGuidance("wait", "等待", blockers[0] + " 技术强弱与入场吸引力分开判断。", TIMEFRAME, "等待确认",
+                               tuple(conditions), entry_invalidation, tuple(conflicts))
+    stop_text = f"吊灯止损参考 {decision.chandelier:.2f}（22 日最高价 − {config.chandelier_atr:g} ATR）" if decision.chandelier else "吊灯止损不可用（缺少 ATR 或 22 日最高价）"
+    position_conditions = [f"已完成日线依据 {_time(daily.as_of)}；SMA20 {sma20:.2f}，SMA50 {sma50:.2f}；{stop_text}。"]
+    if decision.exit == "sell":
+        position_conditions.extend(f"卖出触发已发生：{reason}。" for reason in decision.exit_reasons)
+        invalidation = (f"后续已完成日线重新站上 SMA50（当前 {sma50:.2f}）与吊灯止损，且不再符合偏空规则时，重新评估。",)
+        position = ActionGuidance("reduce_sell", "卖出", "已完成日线触发趋势破坏或止损规则，可考虑卖出；不依据单独的超买或 VWAP 位置退出。",
+                                  TIMEFRAME, "已触发", tuple(position_conditions) + (REFERENCE_NOTE,), invalidation, tuple(conflicts))
+    elif decision.exit == "reduce":
+        position_conditions.extend(f"减仓触发已发生：{reason}。" for reason in decision.exit_reasons)
+        invalidation = (f"收盘重新站上 SMA20（当前 {sma20:.2f}）后可恢复持有观察；若继续跌破 SMA50 或吊灯止损则转为卖出。",)
+        position = ActionGuidance("reduce", "减仓", "短线动能减弱但中期趋势尚未破坏，可考虑部分减仓以锁定利润、降低风险。",
+                                  TIMEFRAME, "已触发", tuple(position_conditions) + (REFERENCE_NOTE,), invalidation, tuple(conflicts))
     else:
-        position_conditions.append("退出条件尚未触发：观察后续已完成日线是否变为偏空，或相邻两日收盘均低于各自 SMA50。")
-        invalidation = (f"后续已完成日线出现偏空／强势偏空结构，或相邻两根已完成日线收盘均低于各自 SMA50（当前 {sma50:.2f}）时，持有观察依据失效，转为减仓／卖出参考。",)
-        position = ActionGuidance("hold", "持有观察", "已完成日线尚未触发退出规则；盘中偏空或 RSI 超买本身不触发卖出。", TIMEFRAME, "持有参考成立；退出未触发", tuple(position_conditions) + (REFERENCE_NOTE,), invalidation, tuple(conflicts))
+        position_conditions.append("退出条件尚未触发：观察是否转为偏空、连续两日收于 SMA50 下方、跌破吊灯止损（卖出），或连续两日收于 SMA20 下方（减仓）。")
+        invalidation = (f"连续两日收于 SMA20 下方转为减仓；偏空结构、连续两日收于 SMA50（{sma50:.2f}）下方或跌破吊灯止损转为卖出。",)
+        position = ActionGuidance("hold", "持有观察", "已完成日线尚未触发退出规则；盘中偏空或 RSI 超买本身不触发卖出。", TIMEFRAME,
+                                  "持有参考成立；退出未触发", tuple(position_conditions) + (REFERENCE_NOTE,), invalidation, tuple(conflicts))
     return attractiveness, entry, position
 
 
@@ -306,14 +329,19 @@ def evaluate_signals(
     now: datetime,
     daily_retrieved_at: datetime,
     intraday_retrieved_at: datetime | None = None,
+    context: MarketContext | None = None,
+    support_resistance=None,
+    config: StrategyConfig | None = None,
 ) -> TechnicalAssessment:
     """Return both position-independent market bias and two action contexts.
 
-    Entry requires strict daily uptrend, RSI in [50, 70), daily SMA20 distance
-    in [0%, 3%], a verified daily reclaim/continuation, and fresh RTH intraday
-    bullish confirmation with price in (0%, 3%] above daily SMA20. A daily
-    bearish bias or two consecutive closes below SMA50 takes exit precedence.
+    Entry and exit decisions come from `analysis.strategy.evaluate_bar` on the
+    two latest completed daily bars. Intraday bars no longer confirm an entry;
+    during an active session they only block chasing a gap beyond the
+    extension limit.
     """
+    config = config or StrategyConfig()
+    context = context or MarketContext()
     local_now = _local(now)
     daily_cutoff = min(local_now, _local(daily_retrieved_at))
     schedule = session_schedule(local_now.date() - timedelta(days=20), local_now.date())
@@ -321,18 +349,24 @@ def evaluate_signals(
     expected = None if ended.empty else ended.index[-1]
     today = local_now.date()
     market_open = today in schedule.index and schedule.loc[today, "market_open"] <= local_now < schedule.loc[today, "market_close"]
-    daily_bias, facts = _daily_bias(_completed(daily, daily_cutoff), expected)
+    daily_bias, facts = _daily_bias(_completed(daily, daily_cutoff), expected, config)
     if intraday_retrieved_at is None:
         intraday_bias, intra_facts = _intraday_bias(intraday.iloc[0:0], local_now, local_now, bool(market_open))
     else:
         intra_cutoff = min(local_now, _local(intraday_retrieved_at))
         intraday_bias, intra_facts = _intraday_bias(intraday, intra_cutoff, local_now, bool(market_open))
-    attractiveness, entry, position = _actions(daily_bias, intraday_bias, facts, intra_facts, bool(market_open), expected)
+    decision = None if facts is None else evaluate_bar(
+        facts["prior"], facts["latest"], config, support_resistance=support_resistance,
+        next_earnings=context.next_earnings, earnings_checked=context.earnings_checked)
+    attractiveness, entry, position = _actions(daily_bias, intraday_bias, facts, intra_facts, bool(market_open),
+                                               expected, decision, config)
     notes = []
     for frame, name, cutoff in ((daily, "日线", daily_cutoff), (intraday, "5 分钟K线", min(local_now, _local(intraday_retrieved_at)) if intraday_retrieved_at is not None else local_now)):
         if not frame.empty and "complete" in frame and frame["complete"].eq(False).any():
             notes.append(f"存在未完成{name}，仅作临时观察，未用于已确认的技术判断或触发条件；数据有效时刻 {_time(cutoff)}。")
-    return TechnicalAssessment(daily_bias, intraday_bias, "不可用" if facts is None else _momentum(facts["rsi"]), attractiveness, entry, position, local_now.to_pydatetime(), tuple(notes))
+    return TechnicalAssessment(daily_bias, intraday_bias, "不可用" if facts is None else _momentum(facts["rsi"]),
+                               attractiveness, entry, position, local_now.to_pydatetime(), tuple(notes),
+                               None if decision is None else decision.score, decision, context.notes)
 
 
-__all__ = ["BiasAssessment", "ActionGuidance", "TechnicalAssessment", "evaluate_signals"]
+__all__ = ["BiasAssessment", "ActionGuidance", "MarketContext", "TechnicalAssessment", "evaluate_signals"]

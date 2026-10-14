@@ -53,12 +53,98 @@ def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return pd.Series(result, index=close.index, name=f"rsi{period}")
 
 
-def daily_indicators(frame: pd.DataFrame) -> pd.DataFrame:
-    """Calculate over the entire warm-up history, before a display crop."""
+def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder ATR that restarts after any missing or non-finite bar.
+
+    The first bar of a run uses high - low; the first `period` true ranges
+    seed an arithmetic mean, then `(previous * (period - 1) + TR) / period`.
+    """
+    highs = pd.to_numeric(high, errors="coerce").to_numpy(dtype=float)
+    lows = pd.to_numeric(low, errors="coerce").to_numpy(dtype=float)
+    closes = pd.to_numeric(close, errors="coerce").to_numpy(dtype=float)
+    result = np.full(len(closes), np.nan)
+    previous_close = None
+    seed: list[float] = []
+    average = None
+    for index in range(len(closes)):
+        h, l, c = highs[index], lows[index], closes[index]
+        if not (np.isfinite(h) and np.isfinite(l) and np.isfinite(c)):
+            previous_close, seed, average = None, [], None
+            continue
+        true_range = h - l if previous_close is None else max(h - l, abs(h - previous_close), abs(l - previous_close))
+        previous_close = c
+        if average is None:
+            seed.append(true_range)
+            if len(seed) < period:
+                continue
+            average = sum(seed) / period
+        else:
+            average = (average * (period - 1) + true_range) / period
+        result[index] = average
+    return pd.Series(result, index=close.index, name=f"atr{period}")
+
+
+def _fibonacci_leg(high: pd.Series, low: pd.Series, lookback: int) -> pd.DataFrame:
+    """Highest high and lowest low of each trailing window, and which came last.
+
+    `fib_up` is True when the high is more recent than the low, so the leg is
+    an advance and retracements are measured down from the high.
+    """
+    highs = pd.to_numeric(high, errors="coerce").to_numpy(dtype=float)
+    lows = pd.to_numeric(low, errors="coerce").to_numpy(dtype=float)
+    size = len(highs)
+    result = pd.DataFrame({"fib_high": np.nan, "fib_low": np.nan, "fib_up": np.nan}, index=high.index)
+    if size < lookback:
+        return result
+    high_windows = np.lib.stride_tricks.sliding_window_view(highs, lookback)
+    low_windows = np.lib.stride_tricks.sliding_window_view(lows, lookback)
+    complete = np.isfinite(high_windows).all(axis=1) & np.isfinite(low_windows).all(axis=1)
+    # Ties prefer the latest bar, so a fresh high is the current leg end.
+    high_position = lookback - 1 - np.argmax(high_windows[:, ::-1], axis=1)
+    low_position = lookback - 1 - np.argmin(low_windows[:, ::-1], axis=1)
+    rows = np.arange(lookback - 1, size)
+    fib_high = np.where(complete, high_windows.max(axis=1, initial=-np.inf, where=np.isfinite(high_windows)), np.nan)
+    fib_low = np.where(complete, low_windows.min(axis=1, initial=np.inf, where=np.isfinite(low_windows)), np.nan)
+    result.iloc[rows, 0] = fib_high
+    result.iloc[rows, 1] = fib_low
+    result.iloc[rows, 2] = np.where(complete, (high_position > low_position).astype(float), np.nan)
+    return result
+
+
+def daily_indicators(frame: pd.DataFrame, fib_lookback: int = 126) -> pd.DataFrame:
+    """Calculate over the entire warm-up history, before a display crop.
+
+    `close` is required. When `high`, `low` and `volume` are present, ATR,
+    volume, pullback and Fibonacci-leg features are added as well. Missing
+    rows (NaN) restart every rolling calculation instead of bridging a gap.
+    """
     result = frame.copy()
-    for period in (20, 50):
-        result[f"sma{period}"] = result["close"].rolling(period, min_periods=period).mean()
-    result["rsi14"] = wilder_rsi(result["close"])
+    close = result["close"]
+    for period in (20, 50, 200):
+        result[f"sma{period}"] = close.rolling(period, min_periods=period).mean()
+    result["rsi14"] = wilder_rsi(close)
+    for period in (63, 126):
+        result[f"ret{period}"] = close / close.shift(period) - 1
+    if {"high", "low"}.issubset(result.columns):
+        result["atr14"] = wilder_atr(result["high"], result["low"], close)
+        result["high22"] = result["high"].rolling(22, min_periods=22).max()
+        result["prev_high"] = result["high"].shift(1)
+        result["pullback_atr5"] = ((result["low"] - result["sma20"]) / result["atr14"]).rolling(5, min_periods=5).min()
+        leg = _fibonacci_leg(result["high"], result["low"], fib_lookback)
+        for column in leg.columns:
+            result[column] = leg[column]
+    if "volume" in result.columns:
+        volume = pd.to_numeric(result["volume"], errors="coerce")
+        result["vol_avg20"] = volume.shift(1).rolling(20, min_periods=20).mean()
+        result["rel_volume"] = volume / result["vol_avg20"].where(result["vol_avg20"] > 0)
+        change = close.diff()
+        up = volume.where(change > 0, 0.0).where(change.notna())
+        down = volume.where(change < 0, 0.0).where(change.notna())
+        up_sum = up.rolling(20, min_periods=20).sum()
+        down_sum = down.rolling(20, min_periods=20).sum()
+        ratio = up_sum / down_sum.where(down_sum > 0)
+        ratio = ratio.where(down_sum > 0, np.where(up_sum > 0, 5.0, np.nan))
+        result["updown_volume20"] = ratio.clip(upper=5.0)
     return result
 
 
